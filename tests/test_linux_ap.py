@@ -10,6 +10,7 @@ import json
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -246,3 +247,41 @@ class TestTwoListAllowlist(unittest.TestCase):
                              allow_egress=["192.0.2.10"]))
         self.assertNotIn("leftover.example.com", f["dnsmasq.conf"])
         self.assertNotIn("192.0.2.10", f["nftables.conf"])
+
+
+class TestBluetoothTrapCheck(unittest.TestCase):
+    """The btusb check must answer "can it load", not "has it loaded".
+
+    On the real VM this reported OK purely because the adapter was not attached
+    yet -- and attaching an AWUS036AXML, which carries Bluetooth on the same chip,
+    is exactly what makes btusb load. A check that passes right up until the moment
+    it matters is worse than no check.
+    """
+
+    def _blacklist_dir(self, contents: dict[str, str]):
+        d = Path(tempfile.mkdtemp())
+        for name, text in contents.items():
+            (d / name).write_text(text)
+        return d
+
+    def test_detects_a_blacklist_entry(self):
+        d = self._blacklist_dir({"blacklist-themis-bt.conf": "blacklist btusb\nblacklist btmtk\n"})
+        with unittest.mock.patch.object(ap, "pathlib") as m:
+            m.Path.return_value = d
+            self.assertTrue(ap.bt_blacklisted())
+
+    def test_shipped_blacklist_file_would_satisfy_the_check(self):
+        # Parse the file we actually ship the same way the check parses it.
+        txt = (ROOT / "netguard/linux/templates/blacklist-themis-bt.conf").read_text()
+        entries = {p[1] for p in (l.split("#", 1)[0].split() for l in txt.splitlines())
+                   if len(p) >= 2 and p[0] == "blacklist"}
+        self.assertIn("btusb", entries)
+        self.assertIn("btmtk", entries)
+
+    def test_commented_out_blacklist_does_not_count(self):
+        d = self._blacklist_dir({"x.conf": "# blacklist btusb\n"})
+        entries = {p[1] for p in (l.split("#", 1)[0].split()
+                                  for l in (d / "x.conf").read_text().splitlines())
+                   if len(p) >= 2 and p[0] == "blacklist"}
+        self.assertNotIn("btusb", entries,
+                         "a commented line must not be read as a blacklist")

@@ -22,6 +22,7 @@ import ipaddress
 import json
 import os
 import re
+import pathlib
 import shutil
 import subprocess
 import sys
@@ -145,6 +146,27 @@ def nm_manages(iface: str) -> bool:
 def rfkill_blocked(iface: str) -> bool:
     txt = out(["rfkill", "list"])
     return bool(re.search(r"(Soft|Hard) blocked:\s*yes", txt))
+
+
+def bt_blacklisted() -> bool:
+    """Is btusb blacklisted on disk, so it cannot load later?
+
+    Checking only /proc/modules answers "has it loaded yet", which is a different
+    and much weaker question -- and it reads as a pass before the adapter is even
+    attached, which is precisely when it is most misleading.
+    """
+    d = pathlib.Path("/etc/modprobe.d")
+    if not d.is_dir():
+        return False
+    for f in d.glob("*.conf"):
+        try:
+            for line in f.read_text(errors="replace").splitlines():
+                parts = line.split("#", 1)[0].split()
+                if len(parts) >= 2 and parts[0] == "blacklist" and parts[1] == "btusb":
+                    return True
+        except OSError:
+            continue
+    return False
 
 
 def centre_index(channel: int, width: int) -> int:
@@ -343,17 +365,36 @@ def cmd_preflight(pol: dict) -> int:
 
     # THE trap: MT7921AU's Bluetooth function crashes its Wi-Fi side on 6.6+.
     bt = sorted(loaded_modules() & set(BT_MODULES))
+    blacklisted = bt_blacklisted()
+    adapter_present = Path(f"/sys/class/net/{ap_if}").exists()
+    bt_fix = (f"        sudo cp {TEMPLATES / 'blacklist-themis-bt.conf'} /etc/modprobe.d/\n"
+              f"        sudo systemctl disable --now bluetooth\n"
+              f"        sudo modprobe -r btusb btmtk   (or reboot)")
     if bt:
         fails.append(
             f"Bluetooth module(s) loaded: {', '.join(bt)}. On kernel 6.6+ this causes "
             f"sporadic mt7921u Wi-Fi crashes, which mid-exam is the worst failure this "
-            f"project has. Fix:\n"
-            f"        sudo cp {TEMPLATES / 'blacklist-themis-bt.conf'} /etc/modprobe.d/\n"
-            f"        sudo systemctl disable --now bluetooth\n"
-            f"        sudo modprobe -r {' '.join(bt)}   (or reboot)"
+            f"project has. Fix:\n{bt_fix}"
+        )
+    elif blacklisted:
+        oks.append("btusb is blacklisted on disk -- it cannot load when the adapter "
+                   "is attached (the mt7921u crash trap is closed)")
+    elif not adapter_present:
+        # The dangerous case. Nothing has loaded btusb because nothing has asked it
+        # to. Attaching an AWUS036AXML -- which carries Bluetooth on the same chip --
+        # is exactly what asks it to, so reporting this as a pass would reassure the
+        # reader at the one moment the reassurance is worthless.
+        fails.append(
+            "btusb is not loaded, but only because the adapter is not attached yet, "
+            "and it is NOT blacklisted. The AWUS036AXML carries Bluetooth on the same "
+            "chip, so attaching it will autoload btusb and put the mt7921u crash back "
+            "on the table. Blacklist it BEFORE you pass the adapter through:\n" + bt_fix
         )
     else:
-        oks.append("Bluetooth modules not loaded (the mt7921u crash trap is closed)")
+        warns.append(
+            "btusb is not loaded and the adapter is attached, but btusb is not "
+            "blacklisted -- nothing stops it loading on the next boot or replug:\n" + bt_fix
+        )
 
     if not Path(f"/sys/class/net/{ap_if}").exists():
         fails.append(f"ap_interface {ap_if!r} does not exist. Plug the adapter in and check `ip link`.")
