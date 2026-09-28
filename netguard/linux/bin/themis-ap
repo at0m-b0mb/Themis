@@ -486,6 +486,18 @@ def cmd_preflight(pol: dict) -> int:
     if rfkill_blocked(ap_if):
         fails.append("a radio is rfkill-blocked  (fix: sudo rfkill unblock all)")
 
+    if shutil.which("nft"):
+        cur = out(["nft", "list", "ruleset"])
+        tables = [l.strip() for l in cur.splitlines() if l.strip().startswith("table ")]
+        if tables:
+            warns.append(
+                f"this host already has {len(tables)} nftables table(s); Themis replaces the "
+                f"whole ruleset while the exam runs.\n"
+                + "".join(f"        {t}\n" for t in tables[:6])
+                + "        `up` saves them and `down` puts them back, but do not run this on a "
+                  "host whose firewall matters."
+            )
+
     ch = int(pol["channel"])
     if ch not in NON_DFS_5GHZ:
         fails.append(f"channel {ch} is DFS or invalid. mt7921u cannot run an AP on a DFS "
@@ -576,8 +588,24 @@ def cmd_up(pol: dict) -> int:
 
     ap_if, srv = pol["ap_interface"], pol["server_ip"]
     bits = pol.get("netmask_bits", 24)
+
+    # The generated ruleset begins with `flush ruleset`, which removes EVERY
+    # nftables rule on this host -- Docker's, libvirt's, the VM's own. Save what is
+    # there so `down` can put it back, instead of leaving the operator to rebuild
+    # their host firewall from memory after an exam.
+    saved = RUN_DIR / "nftables.saved"
+    prior = run(["nft", "list", "ruleset"], check=False)
+    if prior.returncode == 0:
+        saved.write_text(prior.stdout)
+        n = len([l for l in prior.stdout.splitlines() if l.strip().startswith("table ")])
+        print(f"saved the host's existing nftables ruleset ({n} table(s)) to {saved}")
+    else:
+        saved.write_text("")
+        print("could not read the existing nftables ruleset; `down` will simply flush")
+
     STATE.write_text(json.dumps({"ap_interface": ap_if, "profile": pol["profile"],
-                                 "started": time.time()}, indent=2))
+                                 "started": time.time(),
+                                 "saved_ruleset": str(saved)}, indent=2))
 
     print(f"\nconfiguring {ap_if} as {srv}/{bits} ...")
     run(["ip", "addr", "flush", "dev", ap_if], check=False)
@@ -634,7 +662,17 @@ def cmd_down(pol: dict) -> int:
         pf.unlink(missing_ok=True)
 
     run(["nft", "flush", "ruleset"], check=False)
-    print("flushed nftables")
+    saved = RUN_DIR / "nftables.saved"
+    if saved.exists() and saved.read_text().strip():
+        r = run(["nft", "-f", str(saved)], check=False)
+        if r.returncode == 0:
+            print("restored the nftables ruleset that was here before the exam")
+        else:
+            print(f"WARNING: could not restore the previous nftables ruleset.\n"
+                  f"         It is still at {saved} -- reapply with: sudo nft -f {saved}\n"
+                  f"         nft said: {(r.stderr or '').strip()[:200]}", file=sys.stderr)
+    else:
+        print("flushed nftables (there was nothing to restore)")
     run(["ip", "addr", "flush", "dev", ap_if], check=False)
     run(["ip", "link", "set", ap_if, "down"], check=False)
     print(f"released {ap_if}")
