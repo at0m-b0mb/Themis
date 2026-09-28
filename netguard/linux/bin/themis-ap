@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+"""themis-ap -- bring up the Themis exam access point on Linux (Kali, Pi, any distro).
+
+The whole policy lives here, in files you can read:
+    hostapd   the radio, client isolation, and real association events
+    dnsmasq   DHCP and a sinkhole resolver with no upstream
+    nftables  default-deny
+
+    themis-ap preflight   check this host is fit to run an exam
+    themis-ap render      write the configs, change nothing
+    themis-ap up          render, then start the AP
+    themis-ap down        stop it and hand the interface back
+    themis-ap status      what is running, and what it can honestly claim
+
+Preflight is the point of this program. Every check in it exists because getting
+it wrong means a failure during a graded exam.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+TEMPLATES = ROOT / "templates"
+POLICY = ROOT / "policy.json"
+RUN_DIR = Path("/run/themis")
+STATE = RUN_DIR / "state.json"
+JOURNAL = RUN_DIR / "exam.jsonl"
+
+# mt7921u will not run an AP on a DFS channel. US non-DFS 5 GHz channels:
+NON_DFS_5GHZ = {36, 40, 44, 48, 149, 153, 157, 161, 165}
+# AP mode for mt7921u landed in 5.19.
+MIN_KERNEL = (5, 19)
+# The Bluetooth side of an MT7921AU crashes its Wi-Fi side on 6.6+.
+BT_MODULES = ("btusb", "btmtk")
+
+ASSURANCE = {
+    "airgap": [
+        ("Online answer lookup", "BLOCKED", "no route off this network exists"),
+        ("Cloud AI (ChatGPT, Claude, Gemini)", "BLOCKED", "same -- no egress path"),
+        ("VPN", "IMPOSSIBLE", "a VPN client has no server it can reach"),
+        ("Tor", "IMPOSSIBLE", "no bridge or directory authority is reachable"),
+        ("DNS tunnelling", "IMPOSSIBLE", "the resolver runs no-resolv: no upstream, so no exit"),
+        ("Student-to-student", "BLOCKED", "hostapd ap_isolate, and nftables forward policy drop"),
+        ("Local AI model on their laptop", "NOT BLOCKED", "runs offline, emits no traffic -- invisible to any network control"),
+        ("Phone on cellular", "NOT BLOCKED", "never touches this network -- a human in the room is the only control"),
+        ("Leaving for another network", "DETECTED AT THE RADIO", "hostapd reports the disassociation; blocking it would be illegal"),
+    ],
+    "allowlist": [
+        ("Online answer lookup", "PARTLY BLOCKED", "only allowlisted names resolve, but an allowed host may embed or proxy others"),
+        ("Cloud AI (ChatGPT, Claude, Gemini)", "PARTLY BLOCKED", "direct endpoints unreachable; a permitted domain could relay"),
+        ("VPN", "PARTLY BLOCKED", "arbitrary destinations are dropped, but see domain fronting in docs/THREAT_MODEL.md"),
+        ("Tor", "PARTLY BLOCKED", "same caveat"),
+        ("DNS tunnelling", "BLOCKED", "only allowlisted domains are forwarded; the rest sinkhole"),
+        ("Student-to-student", "BLOCKED", "hostapd ap_isolate, and nftables forward policy drop"),
+        ("Local AI model on their laptop", "NOT BLOCKED", "runs offline, emits no traffic"),
+        ("Phone on cellular", "NOT BLOCKED", "never touches this network"),
+        ("Leaving for another network", "DETECTED AT THE RADIO", "hostapd reports the disassociation"),
+    ],
+}
+
+
+def die(msg: str, code: int = 1):
+    print(f"themis-ap: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def run(cmd, check=True, **kw):
+    p = subprocess.run(cmd, capture_output=True, text=True, **kw)
+    if check and p.returncode != 0:
+        die(f"{' '.join(cmd)}\n  exit {p.returncode}: {(p.stderr or p.stdout).strip()}")
+    return p
+
+
+def out(cmd) -> str:
+    return run(cmd, check=False).stdout
+
+
+def load_policy() -> dict:
+    if not POLICY.exists():
+        die(f"no policy at {POLICY}")
+    try:
+        pol = json.loads(POLICY.read_text())
+    except json.JSONDecodeError as e:
+        die(f"policy.json is not valid JSON: {e}")
+    if pol.get("profile") not in ASSURANCE:
+        die(f"unknown profile {pol.get('profile')!r}")
+    if pol["profile"] == "allowlist" and not pol.get("uplink_interface"):
+        die("profile 'allowlist' requires uplink_interface")
+    return pol
+
+
+def kernel_version() -> tuple[int, int]:
+    m = re.match(r"(\d+)\.(\d+)", os.uname().release)
+    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+
+
+def iface_driver(iface: str) -> str | None:
+    link = Path(f"/sys/class/net/{iface}/device/driver")
+    try:
+        return link.resolve().name
+    except OSError:
+        return None
+
+
+def loaded_modules() -> set[str]:
+    try:
+        return {l.split()[0] for l in Path("/proc/modules").read_text().splitlines() if l.split()}
+    except OSError:
+        return set()
+
+
+def supports_ap(iface: str) -> bool | None:
+    """True/False from `iw list`, or None if we could not tell."""
+    phy = Path(f"/sys/class/net/{iface}/phy80211")
+    if not phy.exists():
+        return None
+    text = out(["iw", "list"])
+    if not text:
+        return None
+    block = re.search(r"Supported interface modes:(.*?)(?:\n\s*\w[\w ]*:|\Z)", text, re.S)
+    return ("* AP" in block.group(1)) if block else None
+
+
+def nm_manages(iface: str) -> bool:
+    """NetworkManager will tear down an interface hostapd is using. This is the
+    single most common reason a hand-rolled AP 'randomly' stops working."""
+    if not shutil.which("nmcli"):
+        return False
+    for line in out(["nmcli", "-t", "-f", "DEVICE,STATE", "device"]).splitlines():
+        parts = line.split(":")
+        if len(parts) >= 2 and parts[0] == iface:
+            return parts[1] not in ("unmanaged", "unavailable")
+    return False
+
+
+def rfkill_blocked(iface: str) -> bool:
+    txt = out(["rfkill", "list"])
+    return bool(re.search(r"(Soft|Hard) blocked:\s*yes", txt))
+
+
+def centre_index(channel: int, width: int) -> int:
+    if width >= 80:
+        base = 36 if channel <= 48 else 149
+        return base + 6
+    if width == 40:
+        return channel + 2
+    return channel
+
+
+# --------------------------------------------------------------------------- #
+
+def render(pol: dict) -> dict[str, str]:
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S %Z")
+    prof, ap_if, srv = pol["profile"], pol["ap_interface"], pol["server_ip"]
+    width = int(pol.get("channel_width_mhz", 80))
+    ch = int(pol["channel"])
+
+    if width >= 80:
+        chw, seg = 1, centre_index(ch, 80)
+    else:
+        chw, seg = 0, centre_index(ch, width)
+    width_block = (
+        f"vht_oper_chwidth={chw}\n"
+        f"vht_oper_centr_freq_seg0_idx={seg}\n"
+        f"he_oper_chwidth={chw}\n"
+        f"he_oper_centr_freq_seg0_idx={seg}"
+    )
+
+    ent = pol.get("enterprise") or {}
+    if ent.get("enabled"):
+        auth_block = (
+            "# Tier 2 identity: each student authenticates with their own credential, so\n"
+            "# identity is bound to MAC at association, before any web request happens.\n"
+            "wpa_key_mgmt=WPA-EAP\n"
+            "ieee8021x=1\n"
+            "eap_server=1\n"
+            f"eap_user_file={ent.get('eap_user_file', '/etc/hostapd/themis.eap_user')}\n"
+        )
+    else:
+        auth_block = (
+            "wpa_key_mgmt=WPA-PSK\n"
+            f"wpa_passphrase={pol['passphrase']}\n"
+        )
+
+    hostapd = (TEMPLATES / "hostapd.conf.tmpl").read_text()
+    for k, v in {
+        "PROFILE": prof, "STAMP": stamp, "AP_IF": ap_if, "SSID": pol["ssid"],
+        "COUNTRY": pol["country_code"], "CHANNEL": ch, "WIDTH_BLOCK": width_block,
+        "AUTH_BLOCK": auth_block,
+        "AP_ISOLATE": 1 if pol.get("client_isolation", True) else 0,
+        "MAX_STA": pol.get("max_stations", 25),
+    }.items():
+        hostapd = hostapd.replace("{{%s}}" % k, str(v))
+
+    if prof == "allowlist":
+        up = pol["uplink_interface"]
+        fwd = [f'    iifname "{ap_if}" oifname "{up}" ip daddr {{ {", ".join(pol["allow_egress"])} }} tcp dport {{ 80, 443 }} accept',
+               "    ct state established,related accept"]
+        forward_block = "\n".join(fwd)
+        nat_table = (
+            "\ntable ip themis_nat {\n"
+            "  chain postrouting {\n"
+            "    type nat hook postrouting priority srcnat; policy accept;\n"
+            f'    oifname "{up}" ip saddr {pol["network_cidr"]} masquerade\n'
+            "  }\n"
+            "}\n"
+        )
+    else:
+        forward_block = (
+            "    # Profile 'airgap': nothing is forwarded anywhere. Student-to-student is\n"
+            "    # dropped here as well as by hostapd ap_isolate, and there is no uplink\n"
+            "    # for a VPN or Tor client to reach. This emptiness is the guarantee."
+        )
+        nat_table = ""
+
+    nft = (TEMPLATES / "nftables.conf.tmpl").read_text()
+    for k, v in {
+        "PROFILE": prof, "STAMP": stamp, "AP_IF": ap_if, "NET": pol["network_cidr"],
+        "SRV": srv, "PORTS": ", ".join(str(p) for p in pol.get("server_ports", [80])),
+        "FORWARD_BLOCK": forward_block, "NAT_TABLE": nat_table,
+    }.items():
+        nft = nft.replace("{{%s}}" % k, str(v))
+
+    if prof == "allowlist":
+        dns_body = "".join(f"server=/{d}/1.1.1.1\n" for d in pol["allow_egress"]) + f"address=/#/{srv}\n"
+    else:
+        dns_body = (
+            "# Sinkhole: every name resolves to the exam server, which answers with a\n"
+            "# plain 'blocked during exam' page and logs the attempt.\n"
+            f"address=/#/{srv}\n"
+        )
+
+    bits = int(pol.get("netmask_bits", 24))
+    netmask = ".".join(str((0xFFFFFFFF << (32 - bits) >> s) & 0xFF) for s in (24, 16, 8, 0))
+
+    dns = (TEMPLATES / "dnsmasq.conf.tmpl").read_text()
+    for k, v in {
+        "PROFILE": prof, "STAMP": stamp, "AP_IF": ap_if,
+        "DHCP_START": pol["dhcp_range"][0], "DHCP_END": pol["dhcp_range"][1],
+        "NETMASK": netmask, "DHCP_LEASE": pol.get("dhcp_lease", "3h"),
+        "SRV": srv, "RUN_DIR": str(RUN_DIR), "DNS_BODY": dns_body,
+    }.items():
+        dns = dns.replace("{{%s}}" % k, str(v))
+
+    return {"hostapd.conf": hostapd, "nftables.conf": nft, "dnsmasq.conf": dns}
+
+
+def write_rendered(pol: dict) -> dict[str, Path]:
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    paths = {}
+    for name, text in render(pol).items():
+        p = RUN_DIR / name
+        p.write_text(text)
+        paths[name] = p
+    return paths
+
+
+# --------------------------------------------------------------------------- #
+
+def cmd_preflight(pol: dict) -> int:
+    ap_if, prof = pol["ap_interface"], pol["profile"]
+    fails, warns, oks = [], [], []
+
+    if os.geteuid() != 0:
+        warns.append("not root -- `up` and `down` will need sudo")
+
+    if sys.platform != "linux":
+        fails.append(f"this command runs on Linux; this host is {sys.platform}. "
+                     f"On macOS use netguard/bin/themis-net instead.")
+        _report(prof, fails, warns, oks)
+        return 1
+
+    for tool in ("hostapd", "hostapd_cli", "dnsmasq", "nft", "iw", "ip"):
+        if not shutil.which(tool):
+            fails.append(f"{tool} not installed  (apt install hostapd dnsmasq nftables iw)")
+
+    kv = kernel_version()
+    if kv < MIN_KERNEL:
+        fails.append(f"kernel {kv[0]}.{kv[1]} -- mt7921u AP mode needs {MIN_KERNEL[0]}.{MIN_KERNEL[1]}+")
+    else:
+        oks.append(f"kernel {kv[0]}.{kv[1]} supports mt7921u AP mode")
+
+    # THE trap: MT7921AU's Bluetooth function crashes its Wi-Fi side on 6.6+.
+    bt = sorted(loaded_modules() & set(BT_MODULES))
+    if bt:
+        fails.append(
+            f"Bluetooth module(s) loaded: {', '.join(bt)}. On kernel 6.6+ this causes "
+            f"sporadic mt7921u Wi-Fi crashes, which mid-exam is the worst failure this "
+            f"project has. Fix:\n"
+            f"        sudo cp {TEMPLATES / 'blacklist-themis-bt.conf'} /etc/modprobe.d/\n"
+            f"        sudo systemctl disable --now bluetooth\n"
+            f"        sudo modprobe -r {' '.join(bt)}   (or reboot)"
+        )
+    else:
+        oks.append("Bluetooth modules not loaded (the mt7921u crash trap is closed)")
+
+    if not Path(f"/sys/class/net/{ap_if}").exists():
+        fails.append(f"ap_interface {ap_if!r} does not exist. Plug the adapter in and check `ip link`.")
+    else:
+        drv = iface_driver(ap_if)
+        if drv == "mt7921u":
+            oks.append(f"{ap_if} is driven by the in-tree mt7921u driver")
+        elif drv:
+            warns.append(f"{ap_if} uses driver {drv!r}, not mt7921u. If this is the "
+                         f"AWUS1900 (rtl8814au), it needs an out-of-tree DKMS module that "
+                         f"breaks on kernel updates -- prefer the AWUS036AXML.")
+        ap = supports_ap(ap_if)
+        if ap is False:
+            fails.append(f"`iw list` does not report AP in supported interface modes for {ap_if}")
+        elif ap is None:
+            warns.append(f"could not confirm AP mode support for {ap_if} from `iw list`")
+        else:
+            oks.append("the radio reports AP mode support")
+
+        if nm_manages(ap_if):
+            fails.append(
+                f"NetworkManager is managing {ap_if} and will tear down the AP under "
+                f"hostapd. Fix:  sudo nmcli device set {ap_if} managed no"
+            )
+        else:
+            oks.append(f"NetworkManager is not managing {ap_if}")
+
+    if rfkill_blocked(ap_if):
+        fails.append("a radio is rfkill-blocked  (fix: sudo rfkill unblock all)")
+
+    ch = int(pol["channel"])
+    if ch not in NON_DFS_5GHZ:
+        fails.append(f"channel {ch} is DFS or invalid. mt7921u cannot run an AP on a DFS "
+                     f"channel -- use one of {sorted(NON_DFS_5GHZ)}.")
+    else:
+        oks.append(f"channel {ch} is non-DFS")
+
+    if pol.get("passphrase") == "CHANGE-ME-EVERY-EXAM" and not (pol.get("enterprise") or {}).get("enabled"):
+        fails.append("passphrase is still the placeholder -- set a fresh one for this exam")
+
+    try:
+        fwd = Path("/proc/sys/net/ipv4/ip_forward").read_text().strip()
+    except OSError:
+        fwd = "?"
+    if prof == "airgap" and fwd == "1":
+        fails.append("ip_forward=1 but profile is 'airgap'. Students could route out through "
+                     "this host and the air gap is a fiction.\n"
+                     "        Fix: sudo sysctl -w net.ipv4.ip_forward=0")
+    elif prof == "airgap":
+        oks.append("ip forwarding is off -- no egress path exists for a VPN or Tor client")
+    if prof == "allowlist" and fwd != "1":
+        fails.append("profile 'allowlist' needs: sudo sysctl -w net.ipv4.ip_forward=1")
+
+    _report(prof, fails, warns, oks)
+    return 1 if fails else 0
+
+
+def _report(prof, fails, warns, oks):
+    print(f"themis-ap preflight -- profile {prof!r}\n")
+    for o in oks:
+        print(f"  OK    {o}")
+    for w in warns:
+        print(f"  WARN  {w}")
+    for f in fails:
+        print(f"  FAIL  {f}")
+    print()
+    if fails:
+        print(f"  {len(fails)} blocking problem(s). Not safe to run an exam yet.\n")
+    elif warns:
+        print("  ready, with warnings above\n")
+    else:
+        print("  ready to host an exam\n")
+
+
+def cmd_render(pol: dict) -> int:
+    paths = write_rendered(pol)
+    for name, p in paths.items():
+        print(f"rendered {p}")
+    if shutil.which("nft"):
+        p = run(["nft", "-c", "-f", str(paths["nftables.conf"])], check=False)
+        if p.returncode != 0:
+            print(f"\nnftables REJECTED the ruleset:\n{p.stderr.strip()}", file=sys.stderr)
+            return 1
+        print("\nnftables parsed the ruleset cleanly (nft -c).")
+    return 0
+
+
+def cmd_up(pol: dict) -> int:
+    if os.geteuid() != 0:
+        die("`up` must run as root: sudo netguard/linux/bin/themis-ap up")
+    if cmd_preflight(pol) != 0:
+        die("preflight failed -- not touching the network")
+
+    paths = write_rendered(pol)
+    if run(["nft", "-c", "-f", str(paths["nftables.conf"])], check=False).returncode != 0:
+        die("rendered nftables ruleset is invalid -- refusing to load it")
+
+    ap_if, srv = pol["ap_interface"], pol["server_ip"]
+    bits = pol.get("netmask_bits", 24)
+    STATE.write_text(json.dumps({"ap_interface": ap_if, "profile": pol["profile"],
+                                 "started": time.time()}, indent=2))
+
+    print(f"\nconfiguring {ap_if} as {srv}/{bits} ...")
+    run(["ip", "addr", "flush", "dev", ap_if], check=False)
+    run(["ip", "addr", "add", f"{srv}/{bits}", "dev", ap_if])
+    run(["ip", "link", "set", ap_if, "up"])
+
+    print("loading nftables ruleset ...")
+    run(["nft", "-f", str(paths["nftables.conf"])])
+
+    print("starting dnsmasq (DHCP + sinkhole DNS) ...")
+    run(["dnsmasq", "-C", str(paths["dnsmasq.conf"])])
+
+    print("starting hostapd ...")
+    log = (RUN_DIR / "hostapd.log").open("a")
+    hp = subprocess.Popen(["hostapd", str(paths["hostapd.conf"])], stdout=log, stderr=log)
+    (RUN_DIR / "hostapd.pid").write_text(str(hp.pid))
+
+    # Give hostapd a moment to claim the radio before the hook attaches.
+    for _ in range(20):
+        if Path(f"/var/run/hostapd/{ap_if}").exists():
+            break
+        time.sleep(0.25)
+
+    hook = ROOT / "bin" / "themis-sta-hook"
+    if hook.exists():
+        print("attaching association/disassociation hook ...")
+        ch = subprocess.Popen(["hostapd_cli", "-i", ap_if, "-a", str(hook)],
+                              stdout=log, stderr=log)
+        (RUN_DIR / "hostapd_cli.pid").write_text(str(ch.pid))
+
+    print("\nexam AP is up.\n")
+    return cmd_status(pol)
+
+
+def cmd_down(pol: dict) -> int:
+    if os.geteuid() != 0:
+        die("`down` must run as root: sudo netguard/linux/bin/themis-ap down")
+    ap_if = pol["ap_interface"]
+    if STATE.exists():
+        try:
+            ap_if = json.loads(STATE.read_text()).get("ap_interface", ap_if)
+        except json.JSONDecodeError:
+            pass
+
+    for name in ("hostapd_cli.pid", "hostapd.pid", "dnsmasq.pid"):
+        pf = RUN_DIR / name
+        if not pf.exists():
+            continue
+        try:
+            os.kill(int(pf.read_text().strip()), 15)
+            print(f"stopped {name[:-4]}")
+        except (ProcessLookupError, ValueError):
+            print(f"{name[:-4]} was not running")
+        pf.unlink(missing_ok=True)
+
+    run(["nft", "flush", "ruleset"], check=False)
+    print("flushed nftables")
+    run(["ip", "addr", "flush", "dev", ap_if], check=False)
+    run(["ip", "link", "set", ap_if, "down"], check=False)
+    print(f"released {ap_if}")
+    STATE.unlink(missing_ok=True)
+    print("\nexam AP is down.")
+    return 0
+
+
+def cmd_status(pol: dict) -> int:
+    prof, ap_if = pol["profile"], pol["ap_interface"]
+    hostapd_up = (RUN_DIR / "hostapd.pid").exists()
+    dns_up = (RUN_DIR / "dnsmasq.pid").exists()
+
+    stations = []
+    if hostapd_up and shutil.which("hostapd_cli"):
+        for line in out(["hostapd_cli", "-i", ap_if, "list_sta"]).splitlines():
+            if re.match(r"^[0-9a-f:]{17}$", line.strip()):
+                stations.append(line.strip())
+
+    print(f"profile          {prof}")
+    print(f"ssid             {pol['ssid']}  (channel {pol['channel']}, {pol.get('channel_width_mhz', 80)} MHz)")
+    print(f"hostapd          {'running' if hostapd_up else 'not running'}")
+    print(f"dnsmasq          {'running' if dns_up else 'not running'}")
+    print(f"client isolation {'ON' if pol.get('client_isolation', True) else 'OFF'}")
+    print(f"identity         {'WPA2-Enterprise (per-student credential)' if (pol.get('enterprise') or {}).get('enabled') else 'WPA2-PSK + captive portal (student asserts who they are)'}")
+    print(f"stations         {len(stations)} associated")
+    for s in stations:
+        print(f"                 {s}")
+    print()
+    print("What this setup can honestly claim:")
+    print()
+    w = max(len(r[0]) for r in ASSURANCE[prof])
+    for what, verdict, why in ASSURANCE[prof]:
+        print(f"  {what.ljust(w)}  {verdict}")
+        print(f"  {' '.ljust(w)}  ^ {why}")
+    print()
+    print("  Nothing here inspects a student's machine. It controls a network you own.")
+    print()
+    return 0
+
+
+def main() -> int:
+    cmds = {"preflight": cmd_preflight, "render": cmd_render, "up": cmd_up,
+            "down": cmd_down, "status": cmd_status}
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    if sys.argv[1] not in cmds:
+        die(f"unknown command {sys.argv[1]!r}; try --help")
+    return cmds[sys.argv[1]](load_policy())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

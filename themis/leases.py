@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -99,11 +100,9 @@ def read_leases(path: Path | str = DEFAULT_LEASE_FILE) -> list[Lease]:
     return out
 
 
-def arp_table(interface: str | None = None) -> dict[str, str]:
-    """ip -> mac, as this gateway has actually observed it."""
-    cmd = ["/usr/sbin/arp", "-an"]
+def _arp_table_macos(interface: str | None) -> dict[str, str]:
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        p = subprocess.run(["/usr/sbin/arp", "-an"], capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.TimeoutExpired):
         return {}
     if p.returncode != 0:
@@ -119,6 +118,63 @@ def arp_table(interface: str | None = None) -> dict[str, str]:
         if mac:
             table[m.group("ip")] = mac
     return table
+
+
+def _arp_table_linux(interface: str | None, proc_path: Path | str = "/proc/net/arp") -> dict[str, str]:
+    """Read /proc/net/arp directly rather than shelling out to `ip neigh`.
+
+    Columns: IP address / HW type / Flags / HW address / Mask / Device.
+    A Flags value of 0x0 means the entry is incomplete -- the kernel asked and got
+    no answer -- so it must not be treated as an observation.
+    """
+    try:
+        lines = Path(proc_path).read_text(errors="replace").splitlines()
+    except OSError:
+        return {}
+    table: dict[str, str] = {}
+    for line in lines[1:]:  # first line is the header
+        f = line.split()
+        if len(f) < 6:
+            continue
+        ip, flags, hw, dev = f[0], f[2], f[3], f[5]
+        if interface and dev != interface:
+            continue
+        try:
+            if int(flags, 16) == 0:
+                continue
+        except ValueError:
+            continue
+        mac = normalise_mac(hw)
+        if mac:
+            table[ip] = mac
+    return table
+
+
+def arp_table(interface: str | None = None) -> dict[str, str]:
+    """ip -> mac, as this gateway has actually observed it."""
+    if sys.platform == "linux":
+        return _arp_table_linux(interface)
+    return _arp_table_macos(interface)
+
+
+def hostapd_stations(interface: str) -> set[str] | None:
+    """MACs currently ASSOCIATED at the radio, straight from hostapd.
+
+    This is the best presence source there is, and it exists only on the Linux AP
+    host. A station in this list is associated right now -- not "held a DHCP lease
+    at some point", which is all a lease file can tell you. Returns None when
+    hostapd is not reachable, so callers can fall back rather than read an empty
+    set as "everybody left".
+    """
+    try:
+        p = subprocess.run(["hostapd_cli", "-i", interface, "list_sta"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if p.returncode != 0:
+        return None
+    macs = {m for m in (normalise_mac(l) for l in p.stdout.splitlines()) if m}
+    return macs
 
 
 @dataclass(frozen=True)

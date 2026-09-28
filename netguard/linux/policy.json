@@ -1,0 +1,35 @@
+{
+  "_comment": "Themis exam AP policy for the Kali/Linux host. See docs/LINUX_AP.md. 'airgap' is the only profile that can prove no online lookup, no cloud AI, and no VPN or Tor -- because with no uplink there is nothing for any of them to reach.",
+
+  "profile": "airgap",
+
+  "ap_interface": "wlan1",
+  "uplink_interface": null,
+
+  "ssid": "EXAM-ONLY",
+  "passphrase": "CHANGE-ME-EVERY-EXAM",
+  "country_code": "US",
+
+  "_channel_comment": "mt7921u does NOT support DFS channels in AP mode. Stay on 36-48 or 149-165 (US). 36 with 80MHz width covers 36-48.",
+  "channel": 36,
+  "channel_width_mhz": 80,
+
+  "max_stations": 25,
+  "client_isolation": true,
+
+  "server_ip": "10.83.0.1",
+  "netmask_bits": 24,
+  "network_cidr": "10.83.0.0/24",
+  "dhcp_range": ["10.83.0.50", "10.83.0.200"],
+  "dhcp_lease": "3h",
+  "server_ports": [80, 8080],
+
+  "sinkhole_all_dns": true,
+  "allow_egress": [],
+
+  "enterprise": {
+    "_comment": "Tier 2 identity -- see docs/IDENTITY.md. Not enabled for the first run.",
+    "enabled": false,
+    "eap_user_file": "/etc/hostapd/themis.eap_user"
+  }
+}

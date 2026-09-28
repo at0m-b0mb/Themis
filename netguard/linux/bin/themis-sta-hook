@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Record 802.11 association events in the exam journal, as they happen.
+
+hostapd_cli runs this on every control-interface event:
+
+    themis-sta-hook <interface> <event> [mac] [extra...]
+
+This is why a disconnect is a fact rather than an inference. Polling DHCP leases
+can only notice that a device stopped answering, some seconds later; hostapd knows
+the instant a station disassociates, and says so.
+
+The hook writes and never judges. A disassociation is a radio event with a dozen
+innocent causes -- a lid closing, a battery dying, a student walking out of range
+of one antenna. Turning events into presence intervals is themis/roster.py's job,
+and deciding what any of it means is a human's.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+from themis.journal import Journal  # noqa: E402
+
+JOURNAL = Path("/run/themis/exam.jsonl")
+
+# Only events that say something about presence or the radio's own health are
+# recorded. Everything else hostapd emits is noise for this purpose.
+KINDS = {
+    "AP-STA-CONNECTED": "sta_connected",
+    "AP-STA-DISCONNECTED": "sta_disconnected",
+    "AP-ENABLED": "ap_enabled",
+    "AP-DISABLED": "ap_disabled",
+    "CTRL-EVENT-EAP-SUCCESS": "eap_success",
+    "CTRL-EVENT-EAP-FAILURE": "eap_failure",
+}
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 3:
+        return 0  # hostapd fires this for things we do not care about
+    interface, event = argv[1], argv[2]
+    kind = KINDS.get(event)
+    if kind is None:
+        return 0
+
+    data: dict = {"interface": interface, "hostapd_event": event}
+    if len(argv) > 3 and ":" in argv[3]:
+        data["mac"] = argv[3].strip().lower()
+    if len(argv) > 4:
+        data["extra"] = " ".join(argv[4:])
+
+    try:
+        Journal(JOURNAL).append(kind, data)
+    except OSError:
+        # A hook that raises can wedge hostapd_cli, and losing one event is far
+        # better than losing the AP mid-exam.
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
