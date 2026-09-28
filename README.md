@@ -48,6 +48,44 @@ Two profiles:
   lives in cloud Canvas. Weaker, and `status` says so: pf resolves names at load
   time, and a permitted domain can relay others.
 
+
+## Install on the exam host (Kali or any Linux)
+
+```bash
+git clone https://github.com/at0m-b0mb/Themis.git
+cd Themis
+sudo apt update && sudo apt install -y hostapd dnsmasq nftables iw rfkill
+```
+
+No Python packages to install — everything is stdlib, on purpose.
+
+```bash
+python3 -m unittest discover -s tests      # 98 tests, no hardware needed
+```
+
+Then set `ap_interface` and a fresh `passphrase` in `netguard/linux/policy.json`
+and run preflight. **Read what it says before doing anything else** — it checks
+the three traps that will otherwise bite you during an exam:
+
+```bash
+sudo netguard/linux/bin/themis-ap preflight
+```
+
+Full walkthrough, including the USB passthrough and the Bluetooth blacklist:
+[docs/LINUX_AP.md](docs/LINUX_AP.md).
+
+### See the console without any hardware
+
+```bash
+python3 tools/demo_journal.py /tmp/demo.jsonl
+python3 -m themis.server --policy netguard/linux/policy.json \
+        --journal /tmp/demo.jsonl --review --console-port 8899
+```
+
+Open <http://127.0.0.1:8899/>. That generates a 19-student, 90-minute exam and
+opens it read-only — nothing is written, so it is also exactly how you reopen a
+real exam's record afterwards.
+
 ## What is honestly out of reach
 
 | | |
