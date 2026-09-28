@@ -20,7 +20,7 @@ from themis.journal import Journal
 # passes is a design difference and not a data difference.
 NAMES = [
     "Amara Osei", "Ben Halvorsen", "Chen Wei", "Daniela Rossi", "Ewan Murray",
-    "Fatima Al-Rashid", "Grace Okonkwo", "Hiroshi Tanaka", "InesВарга",
+    "Fatima Al-Rashid", "Grace Okonkwo", "Hiroshi Tanaka", "Ines Varga",
     "Jonas Lindqvist", "Kavya Raman", "Liam O'Connell", "Marta Kowalczyk",
     "Nadia Haddad", "Omar Diallo", "Priya Venkatesan", "Quentin Dubois",
     "Rosa Iglesias", "Sunil Batra",
