@@ -1,0 +1,21 @@
+{
+  "_comment": "Themis exam-network policy. 'airgap' is the only profile that can actually prove no online lookup and no cloud AI. See docs/THREAT_MODEL.md before changing profile.",
+
+  "profile": "airgap",
+
+  "exam_interface": "en7",
+  "server_ip": "10.83.0.1",
+  "netmask": "255.255.255.0",
+  "network_cidr": "10.83.0.0/24",
+  "dhcp_range": ["10.83.0.50", "10.83.0.200"],
+  "dhcp_lease": "3h",
+
+  "server_ports": [80, 8080],
+
+  "sinkhole_all_dns": true,
+  "block_peer_to_peer": true,
+
+  "allow_egress": [],
+
+  "uplink_interface": null
+}

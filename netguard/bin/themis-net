@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""themis-net -- bring up the Themis exam network on macOS.
+
+The travel router is a dumb access point. This machine is the gateway, and
+every policy decision lives here, in files you can read.
+
+    themis-net preflight    check the machine is fit to host an exam
+    themis-net render       write the pf + dnsmasq configs, change nothing
+    themis-net up           render, then start the exam network
+    themis-net down         stop it and restore the previous network state
+    themis-net status       what is running, and what it can actually prove
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+TEMPLATES = ROOT / "templates"
+POLICY = ROOT / "policy.json"
+RUN_DIR = Path("/var/run/themis")
+STATE = RUN_DIR / "state.json"
+
+DNSMASQ_CANDIDATES = [
+    "/opt/homebrew/sbin/dnsmasq",
+    "/usr/local/sbin/dnsmasq",
+]
+
+# Assurance each profile can honestly claim. Printed by `status` verbatim so
+# nobody has to guess how strong the setup actually is.
+ASSURANCE = {
+    "airgap": [
+        ("Online answer lookup", "BLOCKED", "no route off this network exists"),
+        ("Cloud AI (ChatGPT, Claude, Gemini)", "BLOCKED", "same -- no egress path"),
+        ("Student-to-student over exam WiFi", "BLOCKED", "pf drops it; AP isolation backs it up"),
+        ("Local AI model on their laptop", "NOT BLOCKED", "runs offline, emits no traffic -- invisible to any network control"),
+        ("Phone on cellular", "NOT BLOCKED", "never touches this network -- a human in the room is the only control"),
+        ("Switching to another WiFi", "DETECTED, NOT PREVENTED", "heartbeat gap is logged; blocking it would be illegal"),
+    ],
+    "allowlist": [
+        ("Online answer lookup", "PARTLY BLOCKED", "only allowlisted hosts resolve, but an allowed host may embed or proxy others"),
+        ("Cloud AI (ChatGPT, Claude, Gemini)", "PARTLY BLOCKED", "direct endpoints unreachable; a permitted domain could still relay"),
+        ("Student-to-student over exam WiFi", "BLOCKED", "pf drops it; AP isolation backs it up"),
+        ("Local AI model on their laptop", "NOT BLOCKED", "runs offline, emits no traffic -- invisible to any network control"),
+        ("Phone on cellular", "NOT BLOCKED", "never touches this network -- a human in the room is the only control"),
+        ("Switching to another WiFi", "DETECTED, NOT PREVENTED", "heartbeat gap is logged; blocking it would be illegal"),
+    ],
+}
+
+
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"themis-net: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if check and p.returncode != 0:
+        die(f"{' '.join(cmd)}\n  exit {p.returncode}: {(p.stderr or p.stdout).strip()}")
+    return p
+
+
+def sysctl(name: str) -> str:
+    return run(["/usr/sbin/sysctl", "-n", name], check=False).stdout.strip()
+
+
+def load_policy() -> dict:
+    if not POLICY.exists():
+        die(f"no policy at {POLICY}")
+    try:
+        pol = json.loads(POLICY.read_text())
+    except json.JSONDecodeError as e:
+        die(f"policy.json is not valid JSON: {e}")
+    prof = pol.get("profile")
+    if prof not in ASSURANCE:
+        die(f"unknown profile {prof!r}; expected one of {', '.join(ASSURANCE)}")
+    for key in ("exam_interface", "server_ip", "netmask", "network_cidr", "dhcp_range"):
+        if not pol.get(key):
+            die(f"policy.json is missing required key {key!r}")
+    if prof == "allowlist":
+        if not pol.get("allow_egress"):
+            die("profile 'allowlist' requires a non-empty allow_egress list")
+        if not pol.get("uplink_interface"):
+            die("profile 'allowlist' requires uplink_interface (the Mac's route to the internet)")
+    return pol
+
+
+def iface_exists(name: str) -> bool:
+    return run(["/sbin/ifconfig", name], check=False).returncode == 0
+
+
+def dnsmasq_path() -> str | None:
+    for c in DNSMASQ_CANDIDATES:
+        if os.access(c, os.X_OK):
+            return c
+    return shutil.which("dnsmasq")
+
+
+def wifi_ssid() -> str | None:
+    """SSID the Mac itself is joined to, or None. The exam host should be off
+    WiFi entirely -- it is the one machine whose uplink could leak."""
+    p = run(["/usr/sbin/ipconfig", "getsummary", "en0"], check=False)
+    if p.returncode != 0:
+        return None
+    m = re.search(r"\bSSID\s*:\s*(.+)", p.stdout)
+    return m.group(1).strip() if m else None
+
+
+# --------------------------------------------------------------------------- #
+# rendering
+# --------------------------------------------------------------------------- #
+
+def render(pol: dict) -> tuple[str, str]:
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S %Z")
+    prof = pol["profile"]
+    srv = pol["server_ip"]
+    exam_if = pol["exam_interface"]
+
+    # ---- dnsmasq -------------------------------------------------------- #
+    if prof == "airgap" and pol.get("sinkhole_all_dns", True):
+        dns_body = (
+            "# Sinkhole: every name resolves to the exam server, which answers with a\n"
+            "# plain 'blocked during exam' page. The attempt lands in the query log, so a\n"
+            "# blocked lookup is visible without inspecting anybody's machine.\n"
+            f"address=/#/{srv}\n"
+        )
+    elif prof == "allowlist":
+        lines = [
+            "# Only these domains resolve upstream. Everything else is sinkholed to the\n"
+            "# exam server. Note the ceiling: this filters NAMES, not content -- a\n"
+            "# permitted domain that proxies other sites defeats it.\n"
+        ]
+        for dom in pol["allow_egress"]:
+            lines.append(f"server=/{dom}/1.1.1.1\n")
+        lines.append(f"address=/#/{srv}\n")
+        dns_body = "".join(lines)
+    else:
+        dns_body = f"address=/#/{srv}\n"
+
+    dnsmasq = (TEMPLATES / "dnsmasq.conf.tmpl").read_text()
+    for k, v in {
+        "PROFILE": prof,
+        "STAMP": stamp,
+        "EXAM_IF": exam_if,
+        "DHCP_START": pol["dhcp_range"][0],
+        "DHCP_END": pol["dhcp_range"][1],
+        "NETMASK": pol["netmask"],
+        "DHCP_LEASE": pol.get("dhcp_lease", "3h"),
+        "SERVER_IP": srv,
+        "RUN_DIR": str(RUN_DIR),
+        "DNS_BODY": dns_body,
+    }.items():
+        dnsmasq = dnsmasq.replace("{{%s}}" % k, str(v))
+
+    # ---- pf ------------------------------------------------------------- #
+    if prof == "allowlist":
+        up = pol["uplink_interface"]
+        nat_body = (
+            f"nat on {up} from $exam_net to any -> ({up})\n"
+        )
+        egress = [
+            "# Egress to allowlisted hosts only. Forwarded traffic is filtered on BOTH\n"
+            "# interfaces, so each host needs an inbound pass on the exam side and an\n"
+            "# outbound pass on the uplink.\n"
+            "#\n"
+            "# CEILING: pf resolves these names to addresses once, at load time. A host\n"
+            "# behind a CDN whose addresses rotate will silently stop matching. Reload\n"
+            "# before every exam, and prefer the 'airgap' profile whenever you can.\n"
+        ]
+        for dom in pol["allow_egress"]:
+            egress.append(
+                f"pass in  quick on $exam_if proto tcp from $exam_net to {dom} port {{ 80 443 }}\n"
+                f"pass out quick on {up} proto tcp to {dom} port {{ 80 443 }}\n"
+            )
+        egress_body = "".join(egress)
+    else:
+        nat_body = (
+            "# Profile 'airgap': no translation, because there is no uplink to\n"
+            "# translate to. This absence is the guarantee.\n"
+        )
+        egress_body = (
+            "# Profile 'airgap': no egress rules exist. Nothing leaves this network.\n"
+        )
+
+    if pol.get("block_peer_to_peer", True):
+        p2p_body = "block drop quick on $exam_if from $exam_net to $exam_net\n"
+    else:
+        p2p_body = "# block_peer_to_peer disabled in policy.json -- students can reach each other.\n"
+
+    pf = (TEMPLATES / "exam.pf.conf.tmpl").read_text()
+    for k, v in {
+        "PROFILE": prof,
+        "STAMP": stamp,
+        "EXAM_IF": exam_if,
+        "NETWORK_CIDR": pol["network_cidr"],
+        "SERVER_IP": srv,
+        "SERVER_PORTS": " ".join(str(p) for p in pol.get("server_ports", [80])),
+        "NAT_BODY": nat_body,
+        "EGRESS_BODY": egress_body,
+        "P2P_BODY": p2p_body,
+    }.items():
+        pf = pf.replace("{{%s}}" % k, str(v))
+
+    return pf, dnsmasq
+
+
+def write_rendered(pol: dict) -> tuple[Path, Path]:
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    pf_text, dns_text = render(pol)
+    pf_path, dns_path = RUN_DIR / "exam.pf.conf", RUN_DIR / "dnsmasq.conf"
+    pf_path.write_text(pf_text)
+    dns_path.write_text(dns_text)
+    return pf_path, dns_path
+
+
+# --------------------------------------------------------------------------- #
+# commands
+# --------------------------------------------------------------------------- #
+
+def cmd_preflight(pol: dict) -> int:
+    prof = pol["profile"]
+    exam_if = pol["exam_interface"]
+    fails, warns = [], []
+
+    if os.geteuid() != 0:
+        warns.append("not running as root -- `up` and `down` will need sudo")
+
+    if not iface_exists(exam_if):
+        fails.append(
+            f"exam_interface {exam_if!r} does not exist. Plug in the USB-C ethernet "
+            f"adapter that feeds the router and re-check `ifconfig -l`."
+        )
+
+    if not dnsmasq_path():
+        fails.append("dnsmasq not installed -- run: brew install dnsmasq")
+
+    fwd = sysctl("net.inet.ip.forwarding")
+    if prof == "airgap" and fwd == "1":
+        fails.append(
+            "net.inet.ip.forwarding=1 but profile is 'airgap'. With forwarding on, "
+            "students could route out through this Mac and the air gap is a fiction. "
+            "Fix: sudo sysctl -w net.inet.ip.forwarding=0"
+        )
+    if prof == "allowlist" and fwd != "1":
+        fails.append(
+            "profile 'allowlist' needs forwarding on: sudo sysctl -w net.inet.ip.forwarding=1"
+        )
+
+    ssid = wifi_ssid()
+    if prof == "airgap" and ssid:
+        warns.append(
+            f"this Mac is joined to WiFi {ssid!r}. Forwarding is off so students still "
+            f"cannot route out, but the cleanest air gap is an exam host with WiFi off."
+        )
+
+    print(f"themis-net preflight -- profile {prof!r}\n")
+    for f in fails:
+        print(f"  FAIL  {f}")
+    for w in warns:
+        print(f"  WARN  {w}")
+    if not fails and not warns:
+        print("  OK    ready to host an exam")
+    elif not fails:
+        print("\n  ready, with warnings above")
+    print()
+    return 1 if fails else 0
+
+
+def cmd_render(pol: dict) -> int:
+    pf_path, dns_path = write_rendered(pol)
+    print(f"rendered:\n  {pf_path}\n  {dns_path}")
+    p = run(["/sbin/pfctl", "-n", "-f", str(pf_path)], check=False)
+    if p.returncode != 0:
+        print(f"\npf REJECTED the ruleset:\n{p.stderr.strip()}", file=sys.stderr)
+        return 1
+    print("\npf parsed the ruleset cleanly (pfctl -n).")
+    return 0
+
+
+def cmd_up(pol: dict) -> int:
+    if os.geteuid() != 0:
+        die("`up` must run as root: sudo netguard/bin/themis-net up")
+    if cmd_preflight(pol) != 0:
+        die("preflight failed -- not touching the network")
+
+    pf_path, dns_path = write_rendered(pol)
+    if run(["/sbin/pfctl", "-n", "-f", str(pf_path)], check=False).returncode != 0:
+        die("rendered pf ruleset is invalid -- refusing to load it")
+
+    exam_if, srv = pol["exam_interface"], pol["server_ip"]
+    pf_was_enabled = "Status: Enabled" in run(["/sbin/pfctl", "-s", "info"], check=False).stdout
+    STATE.write_text(json.dumps({
+        "pf_was_enabled": pf_was_enabled,
+        "exam_interface": exam_if,
+        "profile": pol["profile"],
+        "started": time.time(),
+    }, indent=2))
+
+    print(f"\nbringing up {exam_if} as {srv} ...")
+    run(["/sbin/ifconfig", exam_if, "inet", srv, "netmask", pol["netmask"], "up"])
+
+    print("loading pf ruleset ...")
+    run(["/sbin/pfctl", "-e"], check=False)   # already-enabled returns nonzero
+    run(["/sbin/pfctl", "-f", str(pf_path)])
+
+    print("starting dnsmasq (DHCP + sinkhole DNS) ...")
+    run([dnsmasq_path(), "-C", str(dns_path)])
+
+    print("\nexam network is up.\n")
+    return cmd_status(pol)
+
+
+def cmd_down(pol: dict) -> int:
+    if os.geteuid() != 0:
+        die("`down` must run as root: sudo netguard/bin/themis-net down")
+
+    st = {}
+    if STATE.exists():
+        try:
+            st = json.loads(STATE.read_text())
+        except json.JSONDecodeError:
+            pass
+    exam_if = st.get("exam_interface", pol["exam_interface"])
+
+    pid_file = RUN_DIR / "dnsmasq.pid"
+    if pid_file.exists():
+        try:
+            os.kill(int(pid_file.read_text().strip()), 15)
+            print("stopped dnsmasq")
+        except (ProcessLookupError, ValueError):
+            print("dnsmasq was not running")
+        pid_file.unlink(missing_ok=True)
+    else:
+        print("no dnsmasq pid file -- nothing to stop")
+
+    if Path("/etc/pf.conf").exists():
+        run(["/sbin/pfctl", "-f", "/etc/pf.conf"], check=False)
+        print("restored /etc/pf.conf")
+    if not st.get("pf_was_enabled", False):
+        run(["/sbin/pfctl", "-d"], check=False)
+        print("disabled pf (it was off before the exam)")
+
+    if iface_exists(exam_if):
+        run(["/sbin/ifconfig", exam_if, "inet", "delete"], check=False)
+        print(f"released {exam_if}")
+
+    STATE.unlink(missing_ok=True)
+    print("\nexam network is down.")
+    return 0
+
+
+def cmd_status(pol: dict) -> int:
+    prof = pol["profile"]
+    pf_info = run(["/sbin/pfctl", "-s", "info"], check=False).stdout
+    pf_on = "Status: Enabled" in pf_info
+    dns_on = (RUN_DIR / "dnsmasq.pid").exists()
+    leases = RUN_DIR / "dhcp.leases"
+    n_clients = len([l for l in leases.read_text().splitlines() if l.strip()]) if leases.exists() else 0
+
+    print(f"profile          {prof}")
+    print(f"pf               {'enabled' if pf_on else 'DISABLED'}")
+    print(f"dnsmasq          {'running' if dns_on else 'not running'}")
+    print(f"ip forwarding    {sysctl('net.inet.ip.forwarding')}")
+    print(f"clients leased   {n_clients}")
+    print()
+    print("What this setup can honestly claim:")
+    print()
+    width = max(len(r[0]) for r in ASSURANCE[prof])
+    for what, verdict, why in ASSURANCE[prof]:
+        print(f"  {what.ljust(width)}  {verdict}")
+        print(f"  {' '.ljust(width)}  ^ {why}")
+    print()
+    print("  Nothing here inspects a student's machine. It controls a network you own.")
+    print()
+    return 0
+
+
+def main() -> int:
+    cmds = {
+        "preflight": cmd_preflight,
+        "render": cmd_render,
+        "up": cmd_up,
+        "down": cmd_down,
+        "status": cmd_status,
+    }
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    cmd = sys.argv[1]
+    if cmd not in cmds:
+        die(f"unknown command {cmd!r}; try --help")
+    return cmds[cmd](load_policy())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
