@@ -76,7 +76,20 @@ def die(msg: str, code: int = 1):
 
 
 def run(cmd, check=True, **kw):
-    p = subprocess.run(cmd, capture_output=True, text=True, **kw)
+    """Run a command, surviving a missing binary.
+
+    subprocess.run raises FileNotFoundError when the program does not exist, which
+    made `preflight` traceback on a host without rfkill instead of reporting what
+    was missing. A diagnostic that dies when a tool is absent fails at exactly the
+    job it exists to do, so a missing binary is now a 127 result like any other
+    failure, and only `check=True` callers escalate.
+    """
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, **kw)
+    except (OSError, subprocess.SubprocessError) as e:
+        if check:
+            die(f"{' '.join(cmd)}: {e}")
+        return subprocess.CompletedProcess(cmd, 127, "", str(e))
     if check and p.returncode != 0:
         die(f"{' '.join(cmd)}\n  exit {p.returncode}: {(p.stderr or p.stdout).strip()}")
     return p
@@ -144,7 +157,10 @@ def nm_manages(iface: str) -> bool:
     return False
 
 
-def rfkill_blocked(iface: str) -> bool:
+def rfkill_blocked(iface: str) -> bool | None:
+    """True/False, or None when rfkill is not installed so we genuinely do not know."""
+    if not shutil.which("rfkill"):
+        return None
     txt = out(["rfkill", "list"])
     return bool(re.search(r"(Soft|Hard) blocked:\s*yes", txt))
 
@@ -250,9 +266,31 @@ def render(pol: dict) -> dict[str, str]:
             f"eap_user_file={ent.get('eap_user_file', '/etc/hostapd/themis.eap_user')}\n"
         )
     else:
+        mode = str(pol.get("security", "wpa2+wpa3")).lower()
+        pmf = int(pol.get("pmf", 1))
+        if mode not in ("wpa2", "wpa2+wpa3", "wpa3"):
+            raise EgressPolicyError(
+                f"security must be one of wpa2, wpa2+wpa3, wpa3 -- got {mode!r}")
+        if mode == "wpa3":
+            # SAE only. Per-session keys, no offline dictionary attack, and PMF is
+            # mandatory under WPA3 so deauth frames are authenticated.
+            keymgmt, pmf = "SAE", 2
+            extra = f"sae_password={pol['passphrase']}\n"
+        elif mode == "wpa2+wpa3":
+            # Transition mode: SAE for clients that can, PSK for those that cannot.
+            keymgmt = "WPA-PSK SAE"
+            extra = (f"wpa_passphrase={pol['passphrase']}\n"
+                     f"sae_password={pol['passphrase']}\n"
+                     "sae_require_mfp=1\n")
+        else:
+            keymgmt, extra = "WPA-PSK", f"wpa_passphrase={pol['passphrase']}\n"
         auth_block = (
-            "wpa_key_mgmt=WPA-PSK\n"
-            f"wpa_passphrase={pol['passphrase']}\n"
+            "# 802.11w. Without management-frame protection, deauthentication frames\n"
+            "# are unauthenticated and any student can disconnect classmates -- which\n"
+            "# then reads as a genuine drop in the proctor console.\n"
+            f"ieee80211w={pmf}\n"
+            f"wpa_key_mgmt={keymgmt}\n"
+            + extra
         )
 
     hostapd = (TEMPLATES / "hostapd.conf.tmpl").read_text()
@@ -401,7 +439,34 @@ def cmd_configure(pol: dict) -> int:
     return 0
 
 
+def preflight_checks(pol: dict) -> dict:
+    """Run every check and return the result as data.
+
+    Same checks, same wording -- the CLI prints this and the operator UI renders
+    it. One implementation, so the panel can never disagree with the terminal
+    about whether the host is fit to run an exam.
+    """
+    fails, warns, oks = _collect(pol)
+    return {
+        "profile": pol.get("profile"),
+        "ok": [{"level": "ok", "message": m} for m in oks],
+        "warn": [{"level": "warn", "message": m} for m in warns],
+        "fail": [{"level": "fail", "message": m} for m in fails],
+        "ready": not fails,
+        "blocking": len(fails),
+    }
+
+
 def cmd_preflight(pol: dict) -> int:
+    if "--json" in sys.argv[2:]:
+        print(json.dumps(preflight_checks(pol), indent=2))
+        return 0 if preflight_checks(pol)["ready"] else 1
+    fails, warns, oks = _collect(pol)
+    _report(pol["profile"], fails, warns, oks)
+    return 1 if fails else 0
+
+
+def _collect(pol: dict):
     ap_if, prof = pol["ap_interface"], pol["profile"]
     fails, warns, oks = [], [], []
 
@@ -411,8 +476,7 @@ def cmd_preflight(pol: dict) -> int:
     if sys.platform != "linux":
         fails.append(f"this command runs on Linux; this host is {sys.platform}. "
                      f"On macOS use netguard/bin/themis-net instead.")
-        _report(prof, fails, warns, oks)
-        return 1
+        return fails, warns, oks
 
     for tool in ("hostapd", "hostapd_cli", "dnsmasq", "nft", "iw", "ip"):
         if not shutil.which(tool):
@@ -483,8 +547,12 @@ def cmd_preflight(pol: dict) -> int:
         else:
             oks.append(f"NetworkManager is not managing {ap_if}")
 
-    if rfkill_blocked(ap_if):
+    rf = rfkill_blocked(ap_if)
+    if rf is True:
         fails.append("a radio is rfkill-blocked  (fix: sudo rfkill unblock all)")
+    elif rf is None:
+        warns.append("rfkill is not installed, so a soft-blocked radio cannot be "
+                     "ruled out  (apt install rfkill)")
 
     if shutil.which("nft"):
         cur = out(["nft", "list", "ruleset"])
@@ -536,8 +604,7 @@ def cmd_preflight(pol: dict) -> int:
                          "'airgap' is the only one that can claim VPN and Tor are "
                          "impossible rather than merely blocked.")
 
-    _report(prof, fails, warns, oks)
-    return 1 if fails else 0
+    return fails, warns, oks
 
 
 def _report(prof, fails, warns, oks):
@@ -576,7 +643,9 @@ def cmd_render(pol: dict) -> int:
 def cmd_up(pol: dict) -> int:
     if os.geteuid() != 0:
         die("`up` must run as root: sudo netguard/linux/bin/themis-ap up")
-    if cmd_preflight(pol) != 0:
+    fails, warns, oks = _collect(pol)
+    _report(pol["profile"], fails, warns, oks)
+    if fails:
         die("preflight failed -- not touching the network")
 
     try:

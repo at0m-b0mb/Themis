@@ -285,3 +285,99 @@ class TestBluetoothTrapCheck(unittest.TestCase):
                    if len(p) >= 2 and p[0] == "blacklist"}
         self.assertNotIn("btusb", entries,
                          "a commented line must not be read as a blacklist")
+
+
+class TestPreflightNeverCrashes(unittest.TestCase):
+    """preflight exists to say what is wrong with a host. If a missing tool makes
+    it traceback instead, it fails exactly when it is needed. This shipped once:
+    a host without rfkill got a FileNotFoundError instead of a checklist."""
+
+    def test_run_survives_a_missing_binary(self):
+        r = ap.run(["definitely-not-a-real-binary-xyz"], check=False)
+        self.assertEqual(r.returncode, 127)
+        self.assertIsInstance(r.stderr, str)
+
+    def test_out_returns_empty_for_a_missing_binary(self):
+        self.assertEqual(ap.out(["definitely-not-a-real-binary-xyz"]), "")
+
+    def test_rfkill_absence_is_unknown_not_false(self):
+        with unittest.mock.patch.object(ap.shutil, "which", return_value=None):
+            self.assertIsNone(ap.rfkill_blocked("wlan0"),
+                              "not knowing must be distinct from knowing it is clear")
+
+    def test_preflight_returns_data_even_with_no_tools_present(self):
+        with unittest.mock.patch.object(ap.shutil, "which", return_value=None):
+            res = ap.preflight_checks(json.loads((ROOT / "netguard/linux/policy.json").read_text()))
+        self.assertIn("ready", res)
+        self.assertFalse(res["ready"])
+        self.assertTrue(res["fail"], "missing tools must be reported as failures")
+        for bucket in ("ok", "warn", "fail"):
+            for c in res[bucket]:
+                self.assertIsInstance(c["message"], str)
+
+
+class TestWifiSecurityModes(unittest.TestCase):
+    """WPA2-PSK alone has two holes that matter in a room of 19 students:
+    unauthenticated deauth frames let any of them disconnect the others, and a
+    shared key lets any of them decrypt the others off the air."""
+
+    def _h(self, **over):
+        pol = policy(passphrase="demo-passphrase-here", ap_interface="wlan0", **over)
+        return ap.render(pol)["hostapd.conf"]
+
+    def test_pmf_is_on_by_default(self):
+        # Without 802.11w a student can deauth classmates, and every one of those
+        # reads as a genuine drop in the proctor console.
+        self.assertIn("ieee80211w=", self._h())
+        self.assertNotIn("ieee80211w=0", self._h())
+
+    def test_default_is_wpa2_wpa3_transition(self):
+        self.assertEqual(POLICY.get("security"), "wpa2+wpa3")
+        h = self._h()
+        self.assertIn("wpa_key_mgmt=WPA-PSK SAE", h)
+        self.assertIn("sae_password=", h)
+        self.assertIn("wpa_passphrase=", h, "older laptops must still be able to join")
+        self.assertIn("sae_require_mfp=1", h)
+
+    def test_wpa3_only_forces_pmf_required_and_drops_psk(self):
+        h = self._h(security="wpa3")
+        self.assertIn("wpa_key_mgmt=SAE", h)
+        self.assertIn("ieee80211w=2", h, "WPA3 mandates management-frame protection")
+        self.assertNotIn("wpa_passphrase=", h,
+                         "SAE-only must not also offer a PSK, or it is not SAE-only")
+
+    def test_wpa2_only_still_available_for_compatibility(self):
+        h = self._h(security="wpa2")
+        self.assertIn("wpa_key_mgmt=WPA-PSK", h)
+        self.assertNotIn("SAE", h)
+
+    def test_an_unknown_security_mode_is_refused(self):
+        with self.assertRaises(ap.EgressPolicyError):
+            self._h(security="wep")
+
+    def test_pmf_level_is_honoured(self):
+        self.assertIn("ieee80211w=2", self._h(pmf=2))
+
+
+class TestExamNetworkCannotReachTheHost(unittest.TestCase):
+    """A student on the exam Wi-Fi must not be able to log into the gateway --
+    the journal, the policy and the passphrase all live on it."""
+
+    def test_no_accept_rule_exposes_ssh_or_anything_but_the_portal(self):
+        n = ap.render(policy(passphrase="s3cret", ap_interface="wlan0"))["nftables.conf"]
+        accepts = [l.strip() for l in n.splitlines()
+                   if l.strip().endswith("accept") and "iifname" in l]
+        for line in accepts:
+            self.assertFalse(
+                "dport 22" in line or "dport 3389" in line,
+                f"remote-access port reachable from the exam network: {line}")
+        self.assertIn("type filter hook input priority filter; policy drop;", n)
+
+    def test_only_the_server_address_is_addressable(self):
+        n = ap.render(policy(passphrase="s3cret", ap_interface="wlan0",
+                             server_ip="10.83.0.1"))["nftables.conf"]
+        for l in n.splitlines():
+            s = l.strip()
+            if s.startswith("iifname") and s.endswith("accept") and "daddr" in s:
+                self.assertIn("ip daddr 10.83.0.1", s,
+                              f"an accept rule targets something other than the server: {s}")

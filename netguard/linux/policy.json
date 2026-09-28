@@ -1,35 +1,36 @@
 {
   "_comment": "Themis exam AP policy for the Kali/Linux host. See docs/LINUX_AP.md. 'airgap' is the only profile that can prove no online lookup, no cloud AI, and no VPN or Tor -- because with no uplink there is nothing for any of them to reach.",
-
   "profile": "airgap",
-
   "ap_interface": "wlan1",
   "uplink_interface": null,
-
   "ssid": "EXAM-ONLY",
   "passphrase": "CHANGE-ME-EVERY-EXAM",
+  "_security_comment": "wpa2 | wpa2+wpa3 | wpa3.  'wpa2+wpa3' (transition) is the default: WPA3 clients get SAE, which means a per-session key and no offline dictionary attack, while older laptops can still join with WPA2. 'wpa3' is strongest but refuses any client without SAE, which at 19 unknown laptops risks excluding a student on exam day -- find out at the dress rehearsal, not on the day.",
+  "security": "wpa2+wpa3",
+  "_pmf_comment": "802.11w management-frame protection. 0=off 1=optional 2=required. Without it, deauthentication frames are unauthenticated and ANY student can knock classmates off the exam network, which then looks exactly like a genuine drop in the proctor console. 1 protects every client that supports it while still admitting those that do not; 2 protects everyone but refuses the rest.",
+  "pmf": 1,
   "country_code": "US",
-
   "_channel_comment": "mt7921u does NOT support DFS channels in AP mode. Stay on 36-48 or 149-165 (US). 36 with 80MHz width covers 36-48.",
   "channel": 36,
   "channel_width_mhz": 80,
-
   "max_stations": 25,
   "client_isolation": true,
-
   "server_ip": "10.83.0.1",
   "netmask_bits": 24,
   "network_cidr": "10.83.0.0/24",
-  "dhcp_range": ["10.83.0.50", "10.83.0.200"],
+  "dhcp_range": [
+    "10.83.0.50",
+    "10.83.0.200"
+  ],
   "dhcp_lease": "3h",
-  "server_ports": [80, 8080],
-
+  "server_ports": [
+    80,
+    8080
+  ],
   "sinkhole_all_dns": true,
-
   "_allowlist_comment": "Profile 'allowlist' only, and it needs TWO lists because the two layers filter different things: dnsmasq filters NAMES, nftables filters ADDRESSES. Keeping them in agreement is manual and goes stale whenever the CDN rotates -- which is the clearest argument for profile 'airgap' or a validating CONNECT proxy instead. See docs/THREAT_MODEL.md.",
   "allow_dns_names": [],
   "allow_egress": [],
-
   "enterprise": {
     "_comment": "Tier 2 identity -- see docs/IDENTITY.md. Not enabled for the first run.",
     "enabled": false,

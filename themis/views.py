@@ -398,3 +398,200 @@ saw it and the first that did not.</p>
 
 <script>{CONSOLE_JS}</script>
 </div></body></html>"""
+
+
+# --- operator control panel ------------------------------------------------ #
+
+OPERATOR_CSS = """
+.step{background:var(--panel); border:1px solid var(--line); border-radius:var(--radius);
+  padding:1.2rem 1.4rem; margin:0 0 .9rem; border-left:3px solid var(--line)}
+.step.done{border-left-color:var(--ok)}
+.step.now{border-left-color:var(--gold)}
+.step.blocked{border-left-color:var(--bad)}
+.step h3{margin:0 0 .15rem; font-size:1rem; font-weight:600; display:flex;
+  align-items:center; gap:.5rem}
+.step .num{display:inline-flex; align-items:center; justify-content:center;
+  width:1.4rem; height:1.4rem; border-radius:50%; font-size:.75rem; font-weight:600;
+  background:var(--gold-soft); color:var(--gold); border:1px solid var(--gold);
+  font-family:ui-monospace,Menlo,monospace}
+.step.done .num{background:var(--ok); color:var(--bg); border-color:var(--ok)}
+.step p.h{margin:.1rem 0 .9rem; color:var(--muted); font-size:.88rem}
+.checks{list-style:none; padding:0; margin:.2rem 0 0; font-size:.88rem}
+.checks li{padding:.28rem 0 .28rem 1.4rem; position:relative; white-space:pre-wrap}
+.checks li:before{position:absolute; left:0; font-weight:700}
+.checks li.ok:before{content:"\\2713"; color:var(--ok)}
+.checks li.warn:before{content:"!"; color:var(--warn)}
+.checks li.fail:before{content:"\\2717"; color:var(--bad)}
+.checks li.fail{color:var(--bad)}
+.checks li.warn{color:var(--warn)}
+.row{display:flex; gap:.6rem; align-items:center; flex-wrap:wrap; margin-top:.7rem}
+select{font:inherit; padding:.55rem .7rem; border-radius:8px; color:var(--ink);
+  background:var(--bg); border:1px solid var(--line)}
+.big{font-size:1rem; padding:.85rem 1.8rem}
+.ghost{background:var(--panel); color:var(--ink); border-color:var(--line)}
+.ghost:hover{border-color:var(--gold); color:var(--gold); filter:none}
+.danger{background:var(--bad); border-color:var(--bad)}
+button[disabled]{opacity:.4; cursor:not-allowed; filter:none}
+.kv{display:grid; grid-template-columns:auto 1fr; gap:.25rem 1rem; font-size:.88rem;
+  margin:.5rem 0 0}
+.kv dt{color:var(--muted)}
+.kv dd{margin:0; font-family:ui-monospace,Menlo,monospace}
+.out{white-space:pre-wrap; font-family:ui-monospace,Menlo,monospace; font-size:.76rem;
+  background:var(--bg); border:1px solid var(--line); border-radius:8px;
+  padding:.7rem .85rem; margin:.8rem 0 0; max-height:16rem; overflow:auto; color:var(--muted)}
+.out.bad{border-color:var(--bad); color:var(--bad)}
+.badge{font-size:.72rem; font-weight:600; padding:.12rem .5rem; border-radius:999px;
+  border:1px solid currentColor; margin-left:auto}
+.badge.up{color:var(--ok)} .badge.downb{color:var(--muted)}
+.working{display:none; font-size:.85rem; color:var(--gold); margin-top:.6rem}
+.working.on{display:block}
+"""
+
+OPERATOR_JS = """
+let busy = false;
+
+function esc(s){ const d=document.createElement('div'); d.textContent=s==null?'':s; return d.innerHTML; }
+
+function checks(pf){
+  const li = (c,l) => `<li class="${l}">${esc(c.message)}</li>`;
+  return '<ul class="checks">'
+    + (pf.fail||[]).map(c=>li(c,'fail')).join('')
+    + (pf.warn||[]).map(c=>li(c,'warn')).join('')
+    + (pf.ok||[]).map(c=>li(c,'ok')).join('')
+    + '</ul>';
+}
+
+function render(s){
+  const pol = s.policy, pf = s.preflight;
+  const configured = !!pol.interface && pol.passphrase_set;
+  const live = s.ap_running && s.portal_running;
+
+  // Step 1 -- host checks
+  const s1 = document.getElementById('s1');
+  s1.className = 'step ' + (pf.ready ? 'done' : 'blocked');
+  document.getElementById('s1body').innerHTML = checks(pf) +
+    (pf.ready ? '' : '<p class="note" style="margin:.8rem 0 0">Fix the items above, then re-check. '
+      + 'Each one is something that would otherwise surface during the exam.</p>');
+
+  // Step 2 -- network
+  const s2 = document.getElementById('s2');
+  s2.className = 'step ' + (configured ? 'done' : (pf.ready ? 'now' : ''));
+  const opts = s.interfaces.length
+    ? s.interfaces.map(i => `<option value="${esc(i.name)}" ${i.name===pol.interface?'selected':''}>`
+        + `${esc(i.name)} — ${esc(i.driver)}${i.preferred?' (recommended)':''}</option>`).join('')
+    : '<option value="">no wireless adapter found</option>';
+  document.getElementById('ifsel').innerHTML = opts;
+  document.getElementById('s2info').innerHTML = configured
+    ? `<dl class="kv"><dt>network</dt><dd>${esc(pol.ssid)}</dd>`
+      + `<dt>password</dt><dd>${esc(pol.passphrase)}</dd>`
+      + `<dt>adapter</dt><dd>${esc(pol.interface)}</dd>`
+      + `<dt>channel</dt><dd>${esc(pol.channel)}</dd></dl>`
+      + '<p class="note" style="margin:.6rem 0 0">Write the password on the board. '
+      + 'It changes every time you press Set up, which is the point.</p>'
+    : '<p class="note" style="margin:.6rem 0 0">Not set up yet.</p>';
+
+  // Step 3 -- run
+  const s3 = document.getElementById('s3');
+  s3.className = 'step ' + (live ? 'done' : (configured && pf.ready ? 'now' : ''));
+  document.getElementById('runbadge').className = 'badge ' + (live ? 'up' : 'downb');
+  document.getElementById('runbadge').textContent = live ? 'exam network is up' : 'stopped';
+  document.getElementById('startbtn').disabled = busy || live || !configured || !pf.ready;
+  document.getElementById('stopbtn').disabled  = busy || !(s.ap_running || s.portal_running);
+  document.getElementById('cfgbtn').disabled   = busy || live || !s.interfaces.length;
+  document.getElementById('recheck').disabled  = busy;
+  document.getElementById('s3links').style.display = live ? 'flex' : 'none';
+  document.getElementById('console').href = 'http://127.0.0.1:' + s.console_port + '/';
+
+  const out = document.getElementById('out');
+  if (s.last && s.last.action){
+    out.style.display = 'block';
+    out.className = 'out' + (s.last.ok === false ? ' bad' : '');
+    out.textContent = s.last.output || '';
+  } else { out.style.display = 'none'; }
+}
+
+async function refresh(){
+  const r = await fetch('/api/state', {cache:'no-store'});
+  render(await r.json());
+}
+
+async function act(action, extra){
+  if (busy) return;
+  busy = true;
+  document.getElementById('working').classList.add('on');
+  document.getElementById('working').textContent =
+    action === 'start_exam' ? 'Starting the radio, DHCP, DNS, firewall and portal…'
+    : action === 'stop_exam' ? 'Stopping the exam and restoring this host…'
+    : 'Working…';
+  try{
+    await fetch('/api/action', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(Object.assign({action}, extra||{}))});
+  }catch(e){ /* the refresh below will show the real state */ }
+  busy = false;
+  document.getElementById('working').classList.remove('on');
+  await refresh();
+}
+
+document.getElementById('cfgbtn').onclick   = () => act('configure', {interface: document.getElementById('ifsel').value});
+document.getElementById('startbtn').onclick = () => act('start_exam');
+document.getElementById('stopbtn').onclick  = () => act('stop_exam');
+document.getElementById('recheck').onclick  = () => refresh();
+
+refresh();
+setInterval(() => { if (!busy) refresh(); }, 5000);
+"""
+
+
+def operator_page() -> str:
+    return f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Themis — set up the exam</title>
+<style>{CSS}{OPERATOR_CSS}</style>
+</head><body><div class="wrap">
+
+<h1>Set up the exam</h1>
+<p class="sub">Three steps. Nothing to type.</p>
+
+<div class="step" id="s1">
+  <h3><span class="num">1</span> This computer
+    <button class="btn2" id="recheck" style="margin-left:auto">Re-check</button>
+  </h3>
+  <p class="h">Whether this host can run an exam at all.</p>
+  <div id="s1body"></div>
+</div>
+
+<div class="step" id="s2">
+  <h3><span class="num">2</span> The exam network</h3>
+  <p class="h">Pick the Wi-Fi adapter. A new password is generated each time.</p>
+  <div class="row">
+    <select id="ifsel"></select>
+    <button id="cfgbtn" class="ghost">Set up</button>
+  </div>
+  <div id="s2info"></div>
+</div>
+
+<div class="step" id="s3">
+  <h3><span class="num">3</span> Run it <span class="badge downb" id="runbadge">stopped</span></h3>
+  <p class="h">Starts the radio, DHCP, DNS, the firewall and the sign-in page together.</p>
+  <div class="row">
+    <button id="startbtn" class="big">Start the exam</button>
+    <button id="stopbtn" class="big danger">Stop the exam</button>
+  </div>
+  <div class="row" id="s3links" style="display:none">
+    <a class="btn2" id="console" href="#" target="_blank">Open the proctor console</a>
+  </div>
+  <div class="working" id="working"></div>
+</div>
+
+<div class="out" id="out" style="display:none"></div>
+
+<hr class="rule">
+<p class="note">While the exam network is up this computer has no internet access.
+That is not a fault — it is the reason a VPN or Tor cannot work from a student's
+laptop. Stopping the exam gives this machine its network and its firewall back.</p>
+<p class="foot">Themis · this panel is reachable only from this machine</p>
+
+<script>{OPERATOR_JS}</script>
+</div></body></html>"""

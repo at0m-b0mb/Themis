@@ -27,6 +27,24 @@ Profile `airgap`, students on the exam SSID, two staff present:
 
 The last three rows are the honest limit. They are handled by people, not code.
 
+## Attacks by students against the exam network itself
+
+The threat model above is about a student getting information *out*. These are
+about a student attacking the network the exam runs on, which is a different thing
+and was missed in the first cut.
+
+| Attack | Status |
+|---|---|
+| **Deauthenticating classmates** to disrupt the exam | Mitigated by 802.11w (`pmf`). Without it, deauth frames are unauthenticated and any student with a laptop can knock the others off — and every one of those reads as a genuine drop in the proctor console, which is the part that makes it nasty. Default is PMF *optional*, which protects every client that supports it; PMF *required* protects all of them but refuses clients that do not. |
+| **Decrypting a classmate's traffic** off the air | WPA2-PSK gives all 19 students the same key, so AP isolation does not stop passive decryption. WPA3-SAE gives each session its own key. Default is transition mode: SAE for clients that support it, PSK for those that do not. |
+| **Offline dictionary attack on the passphrase** | The passphrase is 16 characters from `secrets.token_urlsafe(12)` and rotates every exam. Under SAE it is not subject to offline attack at all. |
+| **Logging into the gateway** | The nftables input chain is `policy drop` and admits only DHCP, DNS to the server, and the portal's TCP ports — all of them to the server address alone. No SSH, no remote access, nothing else reachable from the exam network. Pinned by tests. |
+| **MAC spoofing another student's device** | Not prevented. The device-to-student binding is an assertion under WPA2/WPA3-PSK; only WPA2-Enterprise makes it cryptographic. See [IDENTITY.md](IDENTITY.md). |
+
+The honest residual: everything in this table except the last row assumes the
+student is attacking over the air. A student who is simply *quiet* — a local model,
+a phone on cellular — is unaffected by any of it.
+
 ## Two things Themis deliberately does not do
 
 ### 1. It does not jam, deauth, or interfere with other networks
