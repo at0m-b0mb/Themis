@@ -7,6 +7,7 @@ NOT do -- more than the happy path.
 """
 
 import json
+import time
 import sys
 import tempfile
 import threading
@@ -191,11 +192,14 @@ class TestEscaping(Harness):
         self.assertNotIn(self.PAYLOAD, body)
         self.assertIn("&lt;script&gt;", body)
 
-    def test_name_is_escaped_on_the_console(self):
+    def test_name_is_escaped_in_the_console_api(self):
+        # The console's script interpolates these values into innerHTML, so the
+        # escaping has to happen server-side, in the JSON itself.
         self.register(name=self.PAYLOAD)
-        _, body = self.get("/", port=self.cport)
+        _, body = self.get("/api/state", port=self.cport)
         self.assertNotIn(self.PAYLOAD, body)
-        self.assertIn("&lt;script&gt;", body)
+        d = json.loads(body)
+        self.assertIn("&lt;script&gt;", d["students"][0]["name"])
 
     def test_blocked_page_escapes_the_host_header(self):
         # The Host header is fully attacker-controlled and gets rendered back.
@@ -206,11 +210,24 @@ class TestEscaping(Harness):
 
 
 class TestConsole(Harness):
-    def test_console_lists_registered_students(self):
-        self.register(sid="s01", name="Ada Lovelace")
-        _, body = self.get("/", port=self.cport)
-        self.assertIn("Ada Lovelace", body)
-        self.assertIn("s01", body)
+    def test_api_lists_registered_students(self):
+        self.register(sid="s01", name="Ada Lovelace", seat="3")
+        status, body = self.get("/api/state", port=self.cport)
+        self.assertEqual(status, 200)
+        d = json.loads(body)
+        self.assertEqual(d["counts"]["registered"], 1)
+        st = d["students"][0]
+        self.assertEqual(st["name"], "Ada Lovelace")
+        self.assertEqual(st["student_id"], "s01")
+        self.assertEqual(st["seat"], "3")
+        self.assertTrue(d["chain_ok"])
+        self.assertEqual(len(d["head"]), 64)
+
+    def test_console_shell_renders_without_data(self):
+        status, body = self.get("/", port=self.cport)
+        self.assertEqual(status, 200)
+        self.assertIn("Proctor console", body)
+        self.assertIn("/api/state", body, "the shell must know where to fetch state")
 
     def test_console_states_that_it_decides_nothing(self):
         _, body = self.get("/", port=self.cport)
@@ -261,3 +278,74 @@ class TestPresenceSampling(Harness):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestConsoleApiAndReport(Harness):
+    """The API feeds a script that writes into innerHTML, and the report is read by
+    people who are not looking at this program. Both have to be right."""
+
+    def test_every_api_string_is_html_escaped(self):
+        self.register(sid="s01", name='Bobby <b>Tables</b> & "co"', seat="<i>4</i>")
+        d = json.loads(self.get("/api/state", port=self.cport)[1])
+        st = d["students"][0]
+        for field in ("name", "seat", "student_id", "mac"):
+            self.assertNotIn("<", st[field], f"{field} reached the API unescaped")
+        self.assertIn("&amp;", st["name"])
+
+    def test_anomaly_text_is_escaped_too(self):
+        self.register(sid="s01", name="<script>a</script>")
+        self.resolution = Resolution(ip="127.0.0.1", mac="b8:27:eb:00:11:22",
+                                     source="lease_only")
+        self.register(sid="s02", name="Second")
+        d = json.loads(self.get("/api/state", port=self.cport)[1])
+        self.assertTrue(d["anomalies"], "an uncorroborated registration should flag")
+        for a in d["anomalies"]:
+            self.assertNotIn("<script>", a["detail"])
+            self.assertTrue(a["innocent"], "an anomaly with no innocent reading is an accusation")
+
+    def test_counts_reflect_presence(self):
+        self.register(sid="s01", name="A")
+        self.ctx.journal.append("presence_sample", {"macs": ["a4:83:e7:1b:2c:3d"]})
+        d = json.loads(self.get("/api/state", port=self.cport)[1])
+        self.assertEqual(d["counts"]["online"], 1)
+        self.assertEqual(d["counts"]["offline"], 0)
+
+    def test_elapsed_clock_needs_an_open_event(self):
+        self.register()
+        self.assertEqual(json.loads(self.get("/api/state", port=self.cport)[1])["elapsed"], "\u2014")
+        self.ctx.journal.append("exam_open", {}, ts=time.time() - 3725)
+        # exam_open arriving late still anchors the clock when the roster is rebuilt.
+        el = json.loads(self.get("/api/state", port=self.cport)[1])["elapsed"]
+        self.assertRegex(el, r"^\d\d:\d\d:\d\d$")
+
+    def test_report_explains_how_to_read_itself(self):
+        self.register(sid="s01", name="Ada Lovelace")
+        status, body = self.get("/report.txt", port=self.cport)
+        self.assertEqual(status, 200)
+        self.assertIn("HOW TO READ THIS", body)
+        self.assertIn("a gap is a RANGE", body)
+        self.assertIn("A gap is not misconduct", body)
+        self.assertIn("Ada Lovelace", body)
+        self.assertIn("chain head", body)
+
+    def test_report_warns_that_truncation_is_undetectable(self):
+        body = self.get("/report.txt", port=self.cport)[1]
+        self.assertIn("cannot prove none was removed", body)
+
+    def test_api_reports_a_broken_chain_rather_than_hiding_it(self):
+        self.register(sid="s01", name="Ada Lovelace")
+        path = self.ctx.journal.path
+        before = path.read_text()
+        self.assertIn("Ada Lovelace", before, "precondition: the name is on disk")
+
+        # Edit a recorded name after the fact, as someone altering the record would.
+        path.write_text(before.replace("Ada Lovelace", "Grace Hopper"))
+
+        d = json.loads(self.get("/api/state", port=self.cport)[1])
+        self.assertFalse(d["chain_ok"], "a tampered chain must be reported, not hidden")
+        self.assertIn("BROKEN", d["chain"].upper())
+        self.assertIn("altered", d["chain"])
+
+        # And the console's own report must carry the same warning, since that is
+        # the file a student or a reviewer actually reads.
+        self.assertIn("CHAIN BROKEN", self.get("/report.txt", port=self.cport)[1])
