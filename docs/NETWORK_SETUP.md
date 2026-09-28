@@ -28,9 +28,25 @@ be misconfigured; it is the absence of a route.
 ## Hardware you need
 
 - The TL-WR1502X.
-- **A USB-C ethernet adapter.** Your Mac has no built-in ethernet port
-  (`en4`–`en6` are virtual adapters from your VMware work, not physical).
+- A USB-C ethernet adapter — you already have one: the ASIX **AX88179B** that
+  macOS enumerates as `en7`. (`en4`–`en6` are virtual adapters from your VMware
+  work, not physical ports.)
 - A short ethernet cable.
+
+### Why not the Mac's own Wi-Fi, and why not the Alfa adapters
+
+Both were considered and both are ruled out on facts, not preference:
+
+| Option | Verdict |
+|---|---|
+| Mac's built-in Wi-Fi as the AP (Internet Sharing) | **No.** macOS Internet Sharing caps at ~10 clients; 19 students will not fit. It also runs Apple's own `bootpd` for DHCP and its own NAT, which collide with dnsmasq and the pf ruleset here. |
+| Alfa AWUS1900 (RTL8814AU) | **No.** Realtek's macOS kexts are x86_64-only and cannot load on an ARM64 kernel. No arm64 kext or DriverKit driver exists. |
+| Alfa AWUS036AXML (MT7921AU) | **No**, for the same reason, plus: macOS has no `hostapd` and offers no AP mode to third-party adapters at all. |
+| **TL-WR1502X as a dumb AP** | **Yes.** Purpose-built radio, within capacity at 19, and it holds no policy — which is the point. |
+
+The Alfa adapters are excellent hardware; they are simply unusable as an access
+point on an Apple Silicon Mac. They would need a Linux host — see
+[IDENTITY.md](IDENTITY.md) for the one design where that is worth doing.
 
 ## 1. Router configuration
 
@@ -90,18 +106,17 @@ Mac goes back to how you found it.
 
 ## 3. Dry run with the real class size — do not skip this
 
-**28 clients is at the edge of a travel router's capacity.** AX1500 pocket
-routers are typically comfortable to ~20 associations; past that you get
-association failures and timeouts, which during a graded exam is an
-availability incident affecting real students.
+**19 students is within a TL-WR1502X's comfortable range** (an AX1500 pocket router
+is usually fine to roughly 20 associations), so this is no longer the knife-edge it
+would have been at 28. It is still the single most likely thing to go wrong on the
+day, because association failures during a graded exam are an availability incident
+affecting real students.
 
-Run a dress rehearsal with all 28 laptops associating at once, on a day that
-doesn't matter. If the router struggles, borrow a proper AP (a Ubiquiti U6-Lite
-or any campus-grade AP in standalone mode) — the Mac-as-gateway design is
-unchanged, you are only swapping the radio.
+Run a dress rehearsal with all 19 laptops associating at once, on a day that does
+not matter. Watch for association failures and DHCP timeouts, not just throughput.
 
-Have a paper fallback for every exam. A network problem must never become a
-grading dispute.
+Have a paper fallback for every exam. A network problem must never become a grading
+dispute.
 
 ## 4. What students should be told, before the day
 

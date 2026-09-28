@@ -89,5 +89,5 @@ docs/
 ## Status
 
 Pre-release. The network layer is written and both pf profiles validate under
-`pfctl -n`, but **nothing here has been run against 28 real laptops yet.** Do
+`pfctl -n`, but **nothing here has been run against 19 real laptops yet.** Do
 the dress rehearsal in `docs/NETWORK_SETUP.md` before it counts for marks.
