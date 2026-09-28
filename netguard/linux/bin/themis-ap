@@ -18,6 +18,7 @@ it wrong means a failure during a graded exam.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -157,6 +158,47 @@ def centre_index(channel: int, width: int) -> int:
 
 # --------------------------------------------------------------------------- #
 
+class EgressPolicyError(Exception):
+    """allow_egress contains something nftables cannot safely express."""
+
+
+def _check_egress_are_addresses(entries) -> None:
+    """Refuse hostnames in allow_egress, loudly and with the reason.
+
+    nftables resolves names once at load time and rejects outright any name that
+    resolves to several addresses ("Hostname resolves to multiple addresses"), which
+    is every CDN-hosted service including Canvas. Even where it loads, the result is
+    an ADDRESS allowlist: a student can reach any other site sharing those addresses
+    by setting a different TLS SNI, and the address set goes stale the moment the CDN
+    rotates. So a hostname here would produce either a config that will not load or
+    a control that does not control. Both are worse than saying no.
+    """
+    bad = []
+    for e in entries:
+        try:
+            ipaddress.ip_network(str(e), strict=False)
+        except ValueError:
+            bad.append(str(e))
+    if bad:
+        raise EgressPolicyError(
+            "allow_egress must contain IP addresses or CIDR ranges, not hostnames.\n"
+            f"  offending entries: {', '.join(bad)}\n"
+            "\n"
+            "  Why: nftables rejects any hostname resolving to multiple addresses, which\n"
+            "  is every CDN-hosted service. And an address allowlist does not stop a\n"
+            "  student reaching other sites on the same CDN addresses by changing the TLS\n"
+            "  SNI -- so even when it loads, it does not do what it looks like it does.\n"
+            "\n"
+            "  Either:\n"
+            "    - use profile 'airgap' and serve the exam locally (strongest, and the\n"
+            "      only configuration in which VPN and Tor are impossible rather than\n"
+            "      merely blocked), or\n"
+            "    - pin explicit addresses here and accept that they go stale, or\n"
+            "    - route students through a validating CONNECT proxy, which is the only\n"
+            "      way to filter by NAME rather than by address. See docs/THREAT_MODEL.md."
+        )
+
+
 def render(pol: dict) -> dict[str, str]:
     stamp = time.strftime("%Y-%m-%d %H:%M:%S %Z")
     prof, ap_if, srv = pol["profile"], pol["ap_interface"], pol["server_ip"]
@@ -202,6 +244,7 @@ def render(pol: dict) -> dict[str, str]:
 
     if prof == "allowlist":
         up = pol["uplink_interface"]
+        _check_egress_are_addresses(pol["allow_egress"])
         fwd = [f'    iifname "{ap_if}" oifname "{up}" ip daddr {{ {", ".join(pol["allow_egress"])} }} tcp dport {{ 80, 443 }} accept',
                "    ct state established,related accept"]
         forward_block = "\n".join(fwd)
@@ -230,7 +273,17 @@ def render(pol: dict) -> dict[str, str]:
         nft = nft.replace("{{%s}}" % k, str(v))
 
     if prof == "allowlist":
-        dns_body = "".join(f"server=/{d}/1.1.1.1\n" for d in pol["allow_egress"]) + f"address=/#/{srv}\n"
+        # dnsmasq filters by NAME, so it reads allow_dns_names. nftables filters by
+        # ADDRESS and reads allow_egress. They are separate lists on purpose; a
+        # single list cannot serve both layers.
+        dns_body = (
+            "# Only these names resolve upstream; everything else sinkholes to the portal.\n"
+            "# Ceiling: this filters NAMES, not content. A permitted name that proxies\n"
+            "# other sites defeats it, and nftables must separately permit the addresses\n"
+            "# those names resolve to -- see allow_egress.\n"
+            + "".join(f"server=/{d}/1.1.1.1\n" for d in pol.get("allow_dns_names", []))
+            + f"address=/#/{srv}\n"
+        )
     else:
         dns_body = (
             "# Sinkhole: every name resolves to the exam server, which answers with a\n"
@@ -354,6 +407,21 @@ def cmd_preflight(pol: dict) -> int:
     if prof == "allowlist" and fwd != "1":
         fails.append("profile 'allowlist' needs: sudo sysctl -w net.ipv4.ip_forward=1")
 
+    if prof == "allowlist":
+        names = pol.get("allow_dns_names") or []
+        addrs = pol.get("allow_egress") or []
+        if names and not addrs:
+            fails.append("allow_dns_names is set but allow_egress is empty: names will "
+                         "resolve and then every connection to them will be dropped")
+        if addrs and not names:
+            warns.append("allow_egress is set but allow_dns_names is empty: nothing will "
+                         "resolve, so those addresses are only reachable by literal IP")
+        if names or addrs:
+            warns.append("an allowlist filters names in one layer and addresses in "
+                         "another, and both go stale when the CDN rotates. Profile "
+                         "'airgap' is the only one that can claim VPN and Tor are "
+                         "impossible rather than merely blocked.")
+
     _report(prof, fails, warns, oks)
     return 1 if fails else 0
 
@@ -376,7 +444,10 @@ def _report(prof, fails, warns, oks):
 
 
 def cmd_render(pol: dict) -> int:
-    paths = write_rendered(pol)
+    try:
+        paths = write_rendered(pol)
+    except EgressPolicyError as e:
+        die(str(e))
     for name, p in paths.items():
         print(f"rendered {p}")
     if shutil.which("nft"):
@@ -394,7 +465,10 @@ def cmd_up(pol: dict) -> int:
     if cmd_preflight(pol) != 0:
         die("preflight failed -- not touching the network")
 
-    paths = write_rendered(pol)
+    try:
+        paths = write_rendered(pol)
+    except EgressPolicyError as e:
+        die(str(e))
     if run(["nft", "-c", "-f", str(paths["nftables.conf"])], check=False).returncode != 0:
         die("rendered nftables ruleset is invalid -- refusing to load it")
 

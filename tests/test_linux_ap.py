@@ -76,7 +76,8 @@ class TestRender(unittest.TestCase):
     def test_no_placeholder_survives_rendering(self):
         for prof, extra in (("airgap", {}),
                             ("allowlist", {"uplink_interface": "eth0",
-                                           "allow_egress": ["jhu.instructure.com"]})):
+                                           "allow_dns_names": ["jhu.instructure.com"],
+                                           "allow_egress": ["192.0.2.10"]})):
             with self.subTest(profile=prof):
                 files = ap.render(policy(profile=prof, passphrase="s3cret", **extra))
                 for name, text in files.items():
@@ -118,12 +119,13 @@ class TestRender(unittest.TestCase):
         self.assertNotIn("masquerade", n, "airgap must have no NAT at all")
         self.assertNotIn("themis_nat", n)
 
-    def test_allowlist_adds_nat_and_named_egress_only(self):
+    def test_allowlist_adds_nat_and_addressed_egress_only(self):
         n = ap.render(policy(profile="allowlist", passphrase="s3cret",
                              uplink_interface="eth0",
-                             allow_egress=["jhu.instructure.com"]))["nftables.conf"]
+                             allow_egress=["192.0.2.10", "198.51.100.0/24"]))["nftables.conf"]
         self.assertIn("masquerade", n)
-        self.assertIn("jhu.instructure.com", n)
+        self.assertIn("192.0.2.10", n)
+        self.assertIn("198.51.100.0/24", n)
         self.assertIn("policy drop;", n, "forward must still default to drop")
 
     def test_resolver_has_no_upstream_in_airgap(self):
@@ -173,6 +175,74 @@ class TestNftSyntaxTraps(unittest.TestCase):
     def test_allowlist_destinations_are_a_set(self):
         n = ap.render(policy(profile="allowlist", passphrase="s3cret",
                              uplink_interface="eth0",
-                             allow_egress=["a.example.com", "b.example.com"]))["nftables.conf"]
-        self.assertIn("ip daddr { a.example.com, b.example.com }", n)
+                             allow_egress=["192.0.2.10", "192.0.2.11"]))["nftables.conf"]
+        self.assertIn("ip daddr { 192.0.2.10, 192.0.2.11 }", n)
         self.assertIn("tcp dport { 80, 443 }", n)
+
+
+class TestEgressRefusesHostnames(unittest.TestCase):
+    """`nft -c` proved this in a real container: nftables rejects a hostname that
+    resolves to multiple addresses -- which is every CDN, Canvas included. Rather
+    than emit a config that will not load, the renderer refuses and says why."""
+
+    def _render_allowlist(self, entries):
+        return ap.render(policy(profile="allowlist", passphrase="s3cret",
+                                uplink_interface="eth0", allow_egress=entries))
+
+    def test_hostname_is_refused(self):
+        with self.assertRaises(ap.EgressPolicyError) as cm:
+            self._render_allowlist(["jhu.instructure.com"])
+        msg = str(cm.exception)
+        self.assertIn("jhu.instructure.com", msg)
+        self.assertIn("airgap", msg, "the refusal must point at the working alternative")
+        self.assertIn("SNI", msg, "and must say why an address allowlist is not enough")
+
+    def test_mixed_list_names_every_offender_and_only_offenders(self):
+        with self.assertRaises(ap.EgressPolicyError) as cm:
+            self._render_allowlist(["192.0.2.10", "canvas.example.edu", "bad.example"])
+        msg = str(cm.exception)
+        offenders = msg.split("offending entries:")[1].splitlines()[0]
+        self.assertIn("canvas.example.edu", offenders)
+        self.assertIn("bad.example", offenders)
+        self.assertNotIn("192.0.2.10", offenders,
+                         "a valid address must not be reported as an offender")
+
+    def test_addresses_and_cidrs_are_accepted(self):
+        n = self._render_allowlist(["192.0.2.10", "198.51.100.0/24"])["nftables.conf"]
+        self.assertIn("192.0.2.10", n)
+
+    def test_airgap_never_consults_allow_egress(self):
+        # A stale hostname left in the file must not block the safe profile.
+        n = ap.render(policy(passphrase="s3cret",
+                             allow_egress=["leftover.example.com"]))["nftables.conf"]
+        self.assertNotIn("leftover.example.com", n)
+
+
+class TestTwoListAllowlist(unittest.TestCase):
+    """dnsmasq filters names, nftables filters addresses. One list cannot do both,
+    and pretending otherwise is how an allowlist silently stops filtering."""
+
+    def _p(self, **over):
+        base = dict(profile="allowlist", passphrase="s3cret", uplink_interface="eth0",
+                    allow_dns_names=["canvas.example.edu"], allow_egress=["192.0.2.10"])
+        base.update(over)
+        return policy(**base)
+
+    def test_names_go_to_dnsmasq_addresses_go_to_nftables(self):
+        f = ap.render(self._p())
+        self.assertIn("server=/canvas.example.edu/", f["dnsmasq.conf"])
+        self.assertNotIn("canvas.example.edu", f["nftables.conf"],
+                         "a name must never reach the nft ruleset")
+        self.assertIn("192.0.2.10", f["nftables.conf"])
+        self.assertNotIn("192.0.2.10", f["dnsmasq.conf"])
+
+    def test_dnsmasq_still_sinkholes_everything_else(self):
+        d = ap.render(self._p())["dnsmasq.conf"]
+        self.assertIn("address=/#/10.83.0.1", d)
+
+    def test_airgap_ignores_both_lists(self):
+        f = ap.render(policy(passphrase="s3cret",
+                             allow_dns_names=["leftover.example.com"],
+                             allow_egress=["192.0.2.10"]))
+        self.assertNotIn("leftover.example.com", f["dnsmasq.conf"])
+        self.assertNotIn("192.0.2.10", f["nftables.conf"])
