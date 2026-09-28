@@ -22,6 +22,7 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import pathlib
 import shutil
 import subprocess
@@ -340,6 +341,66 @@ def write_rendered(pol: dict) -> dict[str, Path]:
 
 # --------------------------------------------------------------------------- #
 
+def wireless_interfaces() -> list[str]:
+    """Interface names that have a wiphy, i.e. are actually radios."""
+    out = []
+    net = Path("/sys/class/net")
+    if not net.is_dir():
+        return out
+    for iface in sorted(net.iterdir()):
+        if (iface / "phy80211").exists():
+            out.append(iface.name)
+    return out
+
+
+def cmd_configure(pol: dict) -> int:
+    """Set the AP interface and mint a fresh passphrase for this exam.
+
+    A subcommand rather than a shell snippet because the passphrase should be
+    rotated for every exam, and because a here-doc that calls input() reads EOF
+    from the here-doc itself -- which is exactly how this started.
+    """
+    args = sys.argv[2:]
+    iface = next((a for a in args if not a.startswith("-")), None)
+    keep = "--keep-passphrase" in args
+
+    radios = wireless_interfaces()
+    if iface is None:
+        print("usage: themis-ap configure <interface> [--keep-passphrase]\n")
+        if radios:
+            print("wireless interfaces on this host:")
+            for r in radios:
+                drv = iface_driver(r) or "?"
+                mark = "  <- in-tree mt7921u, the one you want" if drv == "mt7921u" else ""
+                print(f"  {r}   driver {drv}{mark}")
+        else:
+            print("no wireless interfaces found. Pass the adapter through to this VM")
+            print("first, then check `ip link`.")
+        return 1
+
+    if radios and iface not in radios:
+        print(f"themis-ap: {iface!r} is not a wireless interface on this host.",
+              file=sys.stderr)
+        print(f"  found: {', '.join(radios) or '(none)'}", file=sys.stderr)
+        return 1
+
+    pol["ap_interface"] = iface
+    if not keep or pol.get("passphrase") == "CHANGE-ME-EVERY-EXAM":
+        pol["passphrase"] = secrets.token_urlsafe(12)
+    POLICY.write_text(json.dumps(pol, indent=2) + "\n")
+
+    print(f"wrote {POLICY}\n")
+    print(f"  interface   {iface}")
+    print(f"  ssid        {pol['ssid']}")
+    print(f"  passphrase  {pol['passphrase']}")
+    print()
+    print("  Write the passphrase on the board. It is rotated every time you run")
+    print("  this, which is the point -- last term's passphrase should not work.")
+    print()
+    print("  Next:  sudo netguard/linux/bin/themis-ap preflight")
+    return 0
+
+
 def cmd_preflight(pol: dict) -> int:
     ap_if, prof = pol["ap_interface"], pol["profile"]
     fails, warns, oks = [], [], []
@@ -616,8 +677,9 @@ def cmd_status(pol: dict) -> int:
 
 
 def main() -> int:
-    cmds = {"preflight": cmd_preflight, "render": cmd_render, "up": cmd_up,
-            "down": cmd_down, "status": cmd_status}
+    cmds = {"configure": cmd_configure, "preflight": cmd_preflight,
+            "render": cmd_render, "up": cmd_up, "down": cmd_down,
+            "status": cmd_status}
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print(__doc__)
         return 0

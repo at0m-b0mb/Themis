@@ -80,8 +80,17 @@ iw list | grep -A 10 "Supported interface modes"      # expect "* AP"
 
 ### 3. Configure and run
 
-Edit `netguard/linux/policy.json` — at minimum set `ap_interface` and a fresh
-`passphrase` (preflight refuses to start while it is still the placeholder).
+Set the interface and mint a fresh passphrase. Run it with no argument and it
+lists the radios it can see, marking the one on the in-tree driver:
+
+```bash
+sudo netguard/linux/bin/themis-ap configure              # lists candidates
+sudo netguard/linux/bin/themis-ap configure wlan0        # sets it, rotates the passphrase
+```
+
+The passphrase is regenerated on every run, deliberately — last term's should not
+open this term's exam network. Write the printed one on the board. Preflight
+refuses to start while it is still the placeholder.
 
 ```bash
 sudo netguard/linux/bin/themis-ap preflight    # do this first, and read it
