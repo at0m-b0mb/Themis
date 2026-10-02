@@ -150,3 +150,77 @@ class TestHashConstruction(JournalCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestConcurrentWriters(JournalCase):
+    """Two processes really do write this file during an exam: the server, and the
+    hostapd event hook that hostapd_cli spawns fresh per association.
+
+    Before the lock, that broke the chain ON ITS OWN -- a real exam producing a
+    record that read as tampered-with. That is worse than having no chain, because
+    it discredits genuine evidence and the student's record along with it.
+    """
+
+    def test_threads_sharing_a_cached_head_do_not_break_the_chain(self):
+        import threading
+        server = Journal(self.path)          # long-lived, caches its head
+        server.append("exam_open", {})
+        ts = []
+        for i in range(10):
+            ts.append(threading.Thread(target=lambda i=i: Journal(self.path).append("sta_connected", {"i": i})))
+            ts.append(threading.Thread(target=lambda i=i: server.append("presence_sample", {"i": i})))
+        for t in ts: t.start()
+        for t in ts: t.join()
+        v = Journal(self.path).verify()
+        self.assertTrue(v.ok, v.summary())
+        self.assertEqual(v.count, 21, "every append must land, none lost to the race")
+
+    def test_separate_processes_do_not_break_the_chain(self):
+        import subprocess, sys as _sys
+        root = Path(__file__).resolve().parent.parent
+        Journal(self.path).append("exam_open", {})
+        src = (f'import sys; sys.path.insert(0, {str(root)!r})\n'
+               'from themis.journal import Journal\n'
+               f'Journal({str(self.path)!r}).append("sta_connected", {{"m": sys.argv[1]}})\n')
+        procs = [subprocess.Popen([_sys.executable, "-c", src, str(i)]) for i in range(8)]
+        for p in procs:
+            self.assertEqual(p.wait(timeout=30), 0)
+        v = Journal(self.path).verify()
+        self.assertTrue(v.ok, v.summary())
+        self.assertEqual(v.count, 9)
+
+    def test_head_is_read_from_the_file_not_from_memory(self):
+        # Another process appending must be visible to a Journal opened earlier,
+        # or the head published at the end of an exam names the wrong record.
+        a = Journal(self.path)
+        a.append("exam_open", {})
+        stale = a.head
+        Journal(self.path).append("register", {"student_id": "s01"})
+        self.assertNotEqual(a.head, stale, "head must reflect the file, not a cache")
+        self.assertEqual(a.head, Journal(self.path).head)
+
+
+class TestRecordIsNotEphemeral(unittest.TestCase):
+    def test_the_default_journal_is_not_on_tmpfs(self):
+        # It lived in /run/themis next to the pid files, so the whole record of who
+        # was present evaporated on reboot -- silently, and exactly when someone
+        # finally came asking about it.
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from themis.state import ACTIVE_JOURNAL, RUN_DIR
+        self.assertNotIn("/run", str(ACTIVE_JOURNAL),
+                         "the exam record must not live on tmpfs")
+        self.assertIn("/var/lib", str(ACTIVE_JOURNAL))
+        self.assertIn("/run", str(RUN_DIR), "pids and configs SHOULD be ephemeral")
+
+    def test_archive_moves_a_finished_exam_aside(self):
+        import sys as _sys, tempfile as _tf
+        _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from themis.state import archive_previous
+        d = Path(_tf.mkdtemp()) / "exam.jsonl"
+        self.assertIsNone(archive_previous(d), "nothing to archive is not an error")
+        Journal(d).append("exam_open", {})
+        dest = archive_previous(d)
+        self.assertIsNotNone(dest)
+        self.assertTrue(dest.exists())
+        self.assertFalse(d.exists(), "the new exam must start on a clean chain")

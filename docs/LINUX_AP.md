@@ -110,6 +110,22 @@ nftables rule on the host. That is correct for a VM dedicated to being an exam A
 and wrong for a machine doing anything else. Do not run this on a host you care
 about the firewall of.
 
+## Where things are kept
+
+| Path | Survives a reboot? | What it holds |
+|---|---|---|
+| `/var/lib/themis/exam.jsonl` | **Yes** | The exam record. The artifact a student is entitled to see and a department may review months later. |
+| `/var/lib/themis/exam-*.jsonl` | **Yes** | Previous exams, archived automatically when a new one starts. |
+| `/run/themis/` | No, and correctly so | pid files, rendered configs, DHCP leases, the saved nftables ruleset. All meaningless after a reboot. |
+
+The record used to live in `/run/themis` next to the pid files. `/run` is tmpfs, so
+the whole record of who was present evaporated on reboot — silently, and precisely
+when someone finally came asking about it. Check your own host with `df -h /run`.
+
+Back up `/var/lib/themis/` after every exam. Write the chain head on the board when
+the exam closes; published before any review begins, it pins the record you will
+review and closes the one gap the chain cannot cover by itself.
+
 ## What you get that the travel router could not
 
 - **Disconnects are facts, not inferences.** hostapd reports association and

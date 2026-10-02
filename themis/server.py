@@ -35,6 +35,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from themis import views
+from themis.state import ACTIVE_JOURNAL, ensure_dirs
 from themis.journal import Journal
 from themis.leases import hostapd_stations, read_leases, resolve
 from themis.roster import build_roster
@@ -454,6 +455,7 @@ def review(policy: dict, *, journal_path: Path, console_port: int) -> int:
 
 def serve(policy: dict, *, journal_path: Path, student_port: int,
           console_port: int, interval: float) -> int:
+    ensure_dirs()
     ctx = Context(policy, journal_path)
     StudentHandler.ctx = ctx
     ConsoleHandler.ctx = ctx
@@ -502,7 +504,7 @@ def serve(policy: dict, *, journal_path: Path, student_port: int,
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="themis.server", description=__doc__)
     ap.add_argument("--policy", required=True, type=Path)
-    ap.add_argument("--journal", type=Path, default=Path("/run/themis/exam.jsonl"))
+    ap.add_argument("--journal", type=Path, default=ACTIVE_JOURNAL)
     ap.add_argument("--port", type=int, default=80)
     ap.add_argument("--console-port", type=int, default=8081)
     ap.add_argument("--interval", type=float, default=PRESENCE_INTERVAL)

@@ -24,7 +24,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from themis.journal import Journal  # noqa: E402
 
-JOURNAL = Path("/run/themis/exam.jsonl")
+from themis.state import ACTIVE_JOURNAL
+
+JOURNAL = ACTIVE_JOURNAL
 
 # Only events that say something about presence or the radio's own health are
 # recorded. Everything else hostapd emits is noise for this purpose.

@@ -25,6 +25,11 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:            # not POSIX
+    fcntl = None               # type: ignore
+
 GENESIS = "0" * 64
 
 
@@ -102,18 +107,40 @@ class Journal:
         return (last.seq, last.hash) if last else (-1, GENESIS)
 
     def append(self, kind: str, data: dict | None = None, *, ts: float | None = None) -> Event:
-        seq = self._seq + 1
-        stamp = time.time() if ts is None else ts
+        """Append one event, safely against other processes writing the same file.
+
+        There are genuinely two writers during an exam: this server, and the
+        hostapd event hook, which hostapd_cli spawns as a FRESH process per
+        association. An in-memory head cached across appends goes stale the instant
+        the other writer commits, and the chain then breaks on its own -- a real
+        exam producing a record that reads as tampered-with, which is worse than
+        having no chain at all. (There is a test that reproduces exactly that.)
+
+        So the head is re-derived from the file under an exclusive lock, every
+        time. The whole file is re-read to do it: at exam scale that is a few
+        hundred kilobytes per append, and being obviously correct is worth more
+        here than the arithmetic saved by a backward seek.
+        """
         payload = data or {}
-        ev = Event(seq=seq, ts=stamp, kind=kind, data=payload, prev=self._head,
-                   hash=event_hash(seq, stamp, kind, payload, self._head))
-        # Flush and fsync every event: a laptop that loses power mid-exam must not
-        # lose the record of who was present, and a half-written final line is
-        # exactly what read() is built to tolerate.
-        with self.path.open("a", encoding="utf-8") as fh:
-            fh.write(ev.to_json() + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a+", encoding="utf-8") as fh:
+            if fcntl is not None:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                seq, prev = self._tail()          # authoritative: read under the lock
+                seq += 1
+                stamp = time.time() if ts is None else ts
+                ev = Event(seq=seq, ts=stamp, kind=kind, data=payload, prev=prev,
+                           hash=event_hash(seq, stamp, kind, payload, prev))
+                # Flush and fsync every event: a laptop that loses power mid-exam
+                # must not lose the record of who was present, and a half-written
+                # final line is exactly what read() is built to tolerate.
+                fh.write(ev.to_json() + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
         self._seq, self._head = seq, ev.hash
         return ev
 
@@ -160,6 +187,9 @@ class Journal:
 
     @property
     def head(self) -> str:
-        """Current chain tip. Worth writing on the board at the end of an exam:
-        published before any review begins, it pins the record you will review."""
-        return self._head
+        """Current chain tip, read from the file rather than from memory -- another
+        process may have appended since we last did.
+
+        Worth writing on the board at the end of an exam: published before any
+        review begins, it pins the record you will review."""
+        return self._tail()[1]

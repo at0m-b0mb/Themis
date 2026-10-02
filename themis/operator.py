@@ -38,8 +38,9 @@ from themis import views
 ROOT = Path(__file__).resolve().parent.parent
 THEMIS_AP = ROOT / "netguard" / "linux" / "bin" / "themis-ap"
 POLICY = ROOT / "netguard" / "linux" / "policy.json"
-RUN_DIR = Path("/run/themis")
-JOURNAL = RUN_DIR / "exam.jsonl"
+from themis.state import ACTIVE_JOURNAL, DATA_DIR, RUN_DIR, archive_previous, ensure_dirs
+
+JOURNAL = ACTIVE_JOURNAL
 
 CONSOLE_PORT = 8081
 PORTAL_PORT = 80
@@ -198,7 +199,14 @@ class Controller:
         return True, "portal stopped"
 
     def start_exam(self) -> tuple[bool, str]:
+        ensure_dirs()
+        # A new sitting starts on a clean chain. Appending onto the previous exam
+        # would make one chain spanning two of them, so a question about either
+        # could not be answered without handing over the other one's record.
+        archived = archive_previous(JOURNAL)
+        pre = f"archived the previous exam record to {archived}\n" if archived else ""
         ok, txt = self.ap_up()
+        txt = pre + txt
         if not ok:
             return False, txt
         ok2, txt2 = self.portal_start()
