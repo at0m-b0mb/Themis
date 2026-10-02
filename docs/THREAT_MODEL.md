@@ -19,7 +19,7 @@ Profile `airgap`, students on the exam SSID, two staff present:
 |---|---|---|
 | Web search for answers | **Blocked** | No route off the exam network exists. Not filtered — absent. |
 | Cloud AI (ChatGPT, Claude, Gemini) | **Blocked** | Same. No egress path to permit or deny. |
-| Answer sharing over exam WiFi | **Blocked** | `pf` drops student↔student; AP isolation on the router backs it up. |
+| Answer sharing over exam WiFi | **Blocked at the radio** | hostapd `ap_isolate`. The firewall does *not* back this up: traffic between two clients of one AP is relayed inside the radio at layer 2 and never reaches the IP forward hook. If `ap_isolate` is off, nothing else catches it. |
 | Pre-staged answers on a USB stick | Not blocked | Out of scope for a network control. |
 | **Local AI model on their laptop** | **Not blocked** | A 4 GB model runs fully offline and emits no packets. No network control can see it. |
 | **Phone on cellular** | **Not blocked** | Never touches your network. |

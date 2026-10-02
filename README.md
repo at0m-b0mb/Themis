@@ -60,8 +60,20 @@ sudo apt update && sudo apt install -y hostapd dnsmasq nftables iw rfkill
 No Python packages to install — everything is stdlib, on purpose.
 
 ```bash
-python3 -m unittest discover -s tests      # 98 tests, no hardware needed
+python3 -m unittest discover -s tests          # 127 unit tests, no hardware needed
+sudo bash tools/integration_test.sh            # 24 end-to-end checks, no hardware needed
 ```
+
+The integration suite is the one worth running before you trust this. `hostapd`
+needs real hardware, but **association is the only part that does** — so a veth pair
+stands in for the radio link and a network namespace plays a student's laptop, over
+the real generated firewall, the real dnsmasq and the real portal. It checks that a
+student gets an address, that every name resolves to the sign-in page, that HTTP to
+a raw IP is redirected there too, that each OS captive-portal probe returns 302,
+that everything else is refused in milliseconds rather than hanging, that
+registration resolves the MAC from the network rather than trusting the client, that
+the proctor console is unreachable from the student side, and that the record
+verifies afterwards.
 
 Then set `ap_interface` and a fresh `passphrase` in `netguard/linux/policy.json`
 and run preflight. **Read what it says before doing anything else** — it checks

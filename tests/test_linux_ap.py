@@ -407,3 +407,24 @@ class TestExamNetworkCannotReachTheHost(unittest.TestCase):
             if s.startswith("iifname") and s.endswith("accept") and "daddr" in s:
                 self.assertIn("ip daddr 10.83.0.1", s,
                               f"an accept rule targets something other than the server: {s}")
+
+
+class TestNoOverclaimAboutClientIsolation(unittest.TestCase):
+    """status used to say student-to-student was blocked by ap_isolate AND by the
+    nftables forward chain. The second half is false: two clients of one AP are
+    relayed inside the radio at layer 2 and never reach the IP forward hook. If
+    ap_isolate is off, nothing else catches it, and saying otherwise would have the
+    operator trusting a control that does not exist."""
+
+    def test_status_does_not_claim_the_firewall_backs_up_ap_isolate(self):
+        for prof, rows in ap.ASSURANCE.items():
+            row = next((r for r in rows if "Student-to-student" in r[0]), None)
+            self.assertIsNotNone(row, f"{prof} should still report client isolation")
+            why = row[2].lower()
+            self.assertIn("ap_isolate", why)
+            self.assertIn("does not", why.replace("not reach", "does not reach"))
+
+    def test_client_isolation_is_actually_enabled_in_hostapd(self):
+        h = ap.render(policy(passphrase="s3cret", ap_interface="wlan0"))["hostapd.conf"]
+        self.assertIn("ap_isolate=1", h,
+                      "this is the only thing standing between two students")
