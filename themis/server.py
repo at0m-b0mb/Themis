@@ -91,20 +91,27 @@ class Context:
         self._recent[ip] = now
         return (now - last) < window
 
-    def observe_macs(self) -> set[str]:
-        """Who is on the network right now.
+    def observe_macs(self) -> tuple[set[str], str]:
+        """Who is on the network right now, and HOW WE KNOW.
 
-        hostapd is authoritative when available -- a station in its list is
-        associated at this instant. It returning None means we could not ask, which
-        is different from "nobody is here", so we fall back rather than journal an
-        empty sample and manufacture 19 simultaneous disconnections.
+        hostapd is authoritative: a station in its list is associated at this
+        instant. It returning None means we could not ask, which is different from
+        "nobody is here", so we fall back rather than journal an empty sample and
+        manufacture 19 simultaneous disconnections.
+
+        But the fallback is DHCP leases, and a lease lasts hours. If hostapd dies
+        mid-exam, leases would keep every student looking present long after the
+        radio stopped -- a console calmly showing 19 green tiles over a dead
+        network. So the source travels with the sample, and the console says plainly
+        when it is no longer hearing from the radio.
         """
         if self.ap_interface:
             sta = hostapd_stations(self.ap_interface)
             if sta is not None:
-                return sta
+                return sta, "hostapd"
         now = time.time()
-        return {l.mac for l in read_leases(self.lease_file) if not l.expired(now)}
+        leases = {l.mac for l in read_leases(self.lease_file) if not l.expired(now)}
+        return leases, "leases"
 
 
 class StudentHandler(BaseHTTPRequestHandler):
@@ -301,7 +308,16 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             secs = int(end - roster.opened_at)
             elapsed = f"{secs // 3600:02d}:{secs % 3600 // 60:02d}:{secs % 60:02d}"
 
+        # What the most recent sample was actually based on. "leases" while an AP
+        # interface is configured means hostapd stopped answering, and every tile
+        # below is then an hours-old DHCP lease rather than a live association.
+        samples = [e for e in self.ctx.journal.read() if e.kind == "presence_sample"]
+        last_source = samples[-1].data.get("source", "leases") if samples else None
+        degraded = bool(self.ctx.ap_interface) and last_source == "leases"
+
         return {
+            "presence_source": last_source,
+            "presence_degraded": degraded,
             "counts": {
                 "registered": len(roster.registrations),
                 "online": len(roster.online),
@@ -416,11 +432,12 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 def presence_loop(ctx: Context, interval: float, stop: threading.Event):
     while not stop.wait(interval):
         try:
-            macs = ctx.observe_macs()
+            macs, source = ctx.observe_macs()
         except Exception:
             continue  # a sampling failure must never take the portal down
         with ctx.lock:
-            ctx.journal.append("presence_sample", {"macs": sorted(macs)})
+            ctx.journal.append("presence_sample",
+                               {"macs": sorted(macs), "source": source})
 
 
 def review(policy: dict, *, journal_path: Path, console_port: int) -> int:

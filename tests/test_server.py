@@ -250,7 +250,7 @@ class TestConsole(Harness):
 class TestPresenceSampling(Harness):
     def test_sample_records_the_observed_macs(self):
         self.register()
-        self.ctx.observe_macs = lambda: {"a4:83:e7:1b:2c:3d"}
+        self.ctx.observe_macs = lambda: ({"a4:83:e7:1b:2c:3d"}, "hostapd")
         stop = threading.Event()
         t = threading.Thread(target=srv.presence_loop, args=(self.ctx, 0.05, stop), daemon=True)
         t.start()
@@ -266,7 +266,7 @@ class TestPresenceSampling(Harness):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise OSError("hostapd went away")
-            return {"a4:83:e7:1b:2c:3d"}
+            return {"a4:83:e7:1b:2c:3d"}, "hostapd"
         self.ctx.observe_macs = flaky
         stop = threading.Event()
         t = threading.Thread(target=srv.presence_loop, args=(self.ctx, 0.05, stop), daemon=True)
@@ -349,3 +349,40 @@ class TestConsoleApiAndReport(Harness):
         # And the console's own report must carry the same warning, since that is
         # the file a student or a reviewer actually reads.
         self.assertIn("CHAIN BROKEN", self.get("/report.txt", port=self.cport)[1])
+
+
+class TestPresenceSourceIsHonest(Harness):
+    """If hostapd dies mid-exam, presence falls back to DHCP leases -- which last
+    hours. Without saying so, the console would show 19 calm green tiles over a dead
+    radio. The source travels with every sample."""
+
+    def test_sample_records_where_it_came_from(self):
+        self.register()
+        self.ctx.observe_macs = lambda: ({"a4:83:e7:1b:2c:3d"}, "hostapd")
+        stop = threading.Event()
+        t = threading.Thread(target=srv.presence_loop, args=(self.ctx, 0.05, stop), daemon=True)
+        t.start(); stop.wait(0.3); stop.set(); t.join(timeout=2)
+        self.assertEqual(self.ctx.journal.events("presence_sample")[0].data["source"], "hostapd")
+
+    def test_degradation_is_reported_when_an_ap_was_expected(self):
+        self.ctx.ap_interface = "wlan0"
+        self.register()
+        self.ctx.journal.append("presence_sample", {"macs": [], "source": "leases"})
+        d = json.loads(self.get("/api/state", port=self.cport)[1])
+        self.assertTrue(d["presence_degraded"])
+        self.assertEqual(d["presence_source"], "leases")
+
+    def test_leases_are_not_degraded_when_there_is_no_ap(self):
+        # On a host with no AP interface, leases are simply the source, not a fault.
+        self.ctx.ap_interface = None
+        self.register()
+        self.ctx.journal.append("presence_sample", {"macs": [], "source": "leases"})
+        d = json.loads(self.get("/api/state", port=self.cport)[1])
+        self.assertFalse(d["presence_degraded"])
+
+    def test_hostapd_source_is_not_degraded(self):
+        self.ctx.ap_interface = "wlan0"
+        self.register()
+        self.ctx.journal.append("presence_sample", {"macs": [], "source": "hostapd"})
+        d = json.loads(self.get("/api/state", port=self.cport)[1])
+        self.assertFalse(d["presence_degraded"])

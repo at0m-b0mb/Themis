@@ -305,6 +305,14 @@ function render(d){
         <p class="note" style="margin:0">Innocent reading: ${a.innocent}</p></div>`).join('')
     : '<p class="note">Nothing flagged.</p>';
 
+  const warn = document.getElementById('degraded');
+  if (d.presence_degraded){
+    warn.style.display = 'block';
+    warn.innerHTML = '<strong>Not hearing from the radio.</strong> These tiles are now '
+      + 'based on DHCP leases, which last hours — a student who has left may still show '
+      + 'as present. Check that hostapd is still running before trusting anything below.';
+  } else { warn.style.display = 'none'; }
+
   const c = document.getElementById('chain');
   c.className = 'chain' + (d.chain_ok ? '' : ' broken');
   c.innerHTML = `<div><strong>${d.chain_ok ? 'Record intact' : 'RECORD BROKEN'}</strong>
@@ -372,6 +380,7 @@ def console_page(*, policy: dict) -> str:
 </div>
 <p class="sub">{ssid} · channel {ch} · profile {prof} · {esc(ident)}</p>
 
+<div class="chain broken" id="degraded" style="display:none"></div>
 <div class="chain" id="chain"><div>checking the record…</div></div>
 
 <div class="stats" id="stats"></div>

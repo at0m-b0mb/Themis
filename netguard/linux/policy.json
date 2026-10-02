@@ -24,8 +24,7 @@
   ],
   "dhcp_lease": "3h",
   "server_ports": [
-    80,
-    8080
+    80
   ],
   "sinkhole_all_dns": true,
   "_allowlist_comment": "Profile 'allowlist' only, and it needs TWO lists because the two layers filter different things: dnsmasq filters NAMES, nftables filters ADDRESSES. Keeping them in agreement is manual and goes stale whenever the CDN rotates -- which is the clearest argument for profile 'airgap' or a validating CONNECT proxy instead. See docs/THREAT_MODEL.md.",

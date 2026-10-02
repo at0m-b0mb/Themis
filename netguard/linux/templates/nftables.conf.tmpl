@@ -24,6 +24,13 @@ table inet themis {
     iifname "{{AP_IF}}" ip saddr {{NET}} ip daddr {{SRV}} ip protocol icmp icmp type echo-request accept
 
     ct state established,related accept
+
+    # Fail FAST rather than hang. A dropped packet makes a student stare at a
+    # spinner for thirty seconds and assume the exam network is broken; a reset
+    # tells the browser immediately, and is what makes the operating system's own
+    # captive-portal detection pop the sign-in sheet.
+    iifname "{{AP_IF}}" meta l4proto tcp reject with tcp reset
+    iifname "{{AP_IF}}" reject
   }
 
   chain forward {
@@ -35,4 +42,14 @@ table inet themis {
     type filter hook output priority filter; policy accept;
   }
 }
-{{NAT_TABLE}}
+table ip themis_nat {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+
+    # Send ANY plain-HTTP request to the portal, whatever address it was aimed at.
+    # Without this a browser holding a cached IP, or a student typing one, bypasses
+    # the DNS sinkhole entirely and just hangs.
+    iifname "{{AP_IF}}" tcp dport 80 ip daddr != {{SRV}} dnat to {{SRV}}
+  }
+{{NAT_POSTROUTING}}
+}

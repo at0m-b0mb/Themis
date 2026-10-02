@@ -310,12 +310,10 @@ def render(pol: dict) -> dict[str, str]:
                "    ct state established,related accept"]
         forward_block = "\n".join(fwd)
         nat_table = (
-            "\ntable ip themis_nat {\n"
-            "  chain postrouting {\n"
+            "\n  chain postrouting {\n"
             "    type nat hook postrouting priority srcnat; policy accept;\n"
             f'    oifname "{up}" ip saddr {pol["network_cidr"]} masquerade\n'
             "  }\n"
-            "}\n"
         )
     else:
         forward_block = (
@@ -323,13 +321,15 @@ def render(pol: dict) -> dict[str, str]:
             "    # dropped here as well as by hostapd ap_isolate, and there is no uplink\n"
             "    # for a VPN or Tor client to reach. This emptiness is the guarantee."
         )
-        nat_table = ""
+        nat_table = ("\n  # Profile 'airgap': no postrouting chain, because there is no\n"
+                     "  # uplink to translate to. The redirect above is the only\n"
+                     "  # translation here, and it only ever points at this host.\n")
 
     nft = (TEMPLATES / "nftables.conf.tmpl").read_text()
     for k, v in {
         "PROFILE": prof, "STAMP": stamp, "AP_IF": ap_if, "NET": pol["network_cidr"],
         "SRV": srv, "PORTS": ", ".join(str(p) for p in pol.get("server_ports", [80])),
-        "FORWARD_BLOCK": forward_block, "NAT_TABLE": nat_table,
+        "FORWARD_BLOCK": forward_block, "NAT_POSTROUTING": nat_table,
     }.items():
         nft = nft.replace("{{%s}}" % k, str(v))
 
@@ -676,27 +676,86 @@ def cmd_up(pol: dict) -> int:
                                  "started": time.time(),
                                  "saved_ruleset": str(saved)}, indent=2))
 
+    def rollback(why: str) -> int:
+        """Put the host back the way we found it.
+
+        Without this, a failure halfway through leaves the exam firewall loaded and
+        the host's own networking dead -- on the machine the operator is standing
+        at, with students waiting.
+        """
+        print(f"\n{why}\nrolling back ...", file=sys.stderr)
+        for name in ("hostapd_cli.pid", "hostapd.pid", "dnsmasq.pid"):
+            pf = RUN_DIR / name
+            if pf.exists():
+                try:
+                    os.kill(int(pf.read_text().strip()), 15)
+                except (ProcessLookupError, ValueError, OSError):
+                    pass
+                pf.unlink(missing_ok=True)
+        run(["nft", "flush", "ruleset"], check=False)
+        if saved.exists() and saved.read_text().strip():
+            run(["nft", "-f", str(saved)], check=False)
+            print("  restored the previous nftables ruleset", file=sys.stderr)
+        run(["ip", "addr", "flush", "dev", ap_if], check=False)
+        run(["ip", "link", "set", ap_if, "down"], check=False)
+        STATE.unlink(missing_ok=True)
+        print("  host is back as it was. Nothing is broadcasting.", file=sys.stderr)
+        return 1
+
     print(f"\nconfiguring {ap_if} as {srv}/{bits} ...")
     run(["ip", "addr", "flush", "dev", ap_if], check=False)
-    run(["ip", "addr", "add", f"{srv}/{bits}", "dev", ap_if])
-    run(["ip", "link", "set", ap_if, "up"])
+    if run(["ip", "addr", "add", f"{srv}/{bits}", "dev", ap_if], check=False).returncode != 0:
+        return rollback(f"could not assign {srv}/{bits} to {ap_if}")
+    if run(["ip", "link", "set", ap_if, "up"], check=False).returncode != 0:
+        return rollback(f"could not bring {ap_if} up")
 
     print("loading nftables ruleset ...")
-    run(["nft", "-f", str(paths["nftables.conf"])])
+    r = run(["nft", "-f", str(paths["nftables.conf"])], check=False)
+    if r.returncode != 0:
+        return rollback(f"nftables refused the ruleset: {(r.stderr or '').strip()[:300]}")
 
     print("starting dnsmasq (DHCP + sinkhole DNS) ...")
-    run(["dnsmasq", "-C", str(paths["dnsmasq.conf"])])
+    r = run([shutil.which("dnsmasq") or "dnsmasq", "-C", str(paths["dnsmasq.conf"])], check=False)
+    if r.returncode != 0:
+        return rollback("dnsmasq would not start -- students would associate and get "
+                        f"no address:\n  {(r.stderr or r.stdout or '').strip()[:300]}")
 
     print("starting hostapd ...")
     log = (RUN_DIR / "hostapd.log").open("a")
     hp = subprocess.Popen(["hostapd", str(paths["hostapd.conf"])], stdout=log, stderr=log)
     (RUN_DIR / "hostapd.pid").write_text(str(hp.pid))
 
-    # Give hostapd a moment to claim the radio before the hook attaches.
-    for _ in range(20):
-        if Path(f"/var/run/hostapd/{ap_if}").exists():
+    # Wait for hostapd to actually CLAIM the radio, and notice if it dies trying.
+    # Printing "exam AP is up" because a process was spawned is how an operator ends
+    # up believing the exam network exists while students see nothing at all.
+    ctrl = Path("/var/run/hostapd") / ap_if
+    enabled = False
+    for _ in range(40):                      # up to 10s
+        if hp.poll() is not None:
+            tail = (RUN_DIR / "hostapd.log").read_text(errors="replace")[-700:]
+            return rollback(f"hostapd exited immediately (status {hp.returncode}):\n{tail}")
+        if ctrl.exists():
+            enabled = True
             break
         time.sleep(0.25)
+    if not enabled:
+        tail = (RUN_DIR / "hostapd.log").read_text(errors="replace")[-700:]
+        return rollback("hostapd is running but never claimed the radio "
+                        f"(no control socket at {ctrl} after 10s):\n{tail}")
+
+    # The control socket exists, but AP-ENABLED is what says the beacon is out.
+    beaconing = False
+    for _ in range(20):                      # up to 5s more
+        if "AP-ENABLED" in (RUN_DIR / "hostapd.log").read_text(errors="replace")[-4000:]:
+            beaconing = True
+            break
+        if hp.poll() is not None:
+            tail = (RUN_DIR / "hostapd.log").read_text(errors="replace")[-700:]
+            return rollback(f"hostapd died while enabling the AP:\n{tail}")
+        time.sleep(0.25)
+    if not beaconing:
+        print("  note: hostapd has the radio but has not logged AP-ENABLED yet.",
+              file=sys.stderr)
 
     hook = ROOT / "bin" / "themis-sta-hook"
     if hook.exists():

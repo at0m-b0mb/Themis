@@ -114,11 +114,37 @@ class TestRender(unittest.TestCase):
         self.assertNotIn("wpa_passphrase", e,
                          "Enterprise mode must not also ship a shared passphrase")
 
-    def test_airgap_forwards_nothing_and_has_no_nat(self):
-        n = ap.render(policy(passphrase="s3cret"))["nftables.conf"]
+    def test_airgap_forwards_nothing_and_translates_only_to_itself(self):
+        # airgap DOES translate now -- the port-80 redirect that makes the captive
+        # portal catch a browser holding a cached IP. The invariant is not "no NAT",
+        # it is that no translation can ever point off this host.
+        n = ap.render(policy(passphrase="s3cret", ap_interface="wlan0",
+                             server_ip="10.83.0.1"))["nftables.conf"]
         self.assertIn("type filter hook forward priority filter; policy drop;", n)
-        self.assertNotIn("masquerade", n, "airgap must have no NAT at all")
-        self.assertNotIn("themis_nat", n)
+        self.assertNotIn("masquerade", n, "airgap must never masquerade -- there is no uplink")
+        # Look for the chain, not the word: the comment explaining its absence
+        # legitimately contains it.
+        self.assertNotIn("type nat hook postrouting", n)
+        dnats = [l.strip() for l in n.splitlines() if "dnat to" in l]
+        self.assertTrue(dnats, "the portal redirect should be present")
+        for d in dnats:
+            self.assertIn("dnat to 10.83.0.1", d,
+                          f"a translation points somewhere other than this host: {d}")
+
+    def test_http_to_any_address_reaches_the_portal(self):
+        n = ap.render(policy(passphrase="s3cret", ap_interface="wlan0"))["nftables.conf"]
+        self.assertIn("tcp dport 80 ip daddr != 10.83.0.1 dnat to 10.83.0.1", n)
+
+    def test_students_get_a_reset_not_a_hang(self):
+        # A drop makes a student stare at a spinner and conclude the exam network is
+        # broken; a reset fails immediately and is what pops the OS sign-in sheet.
+        n = ap.render(policy(passphrase="s3cret", ap_interface="wlan0"))["nftables.conf"]
+        self.assertIn('iifname "wlan0" meta l4proto tcp reject with tcp reset', n)
+        self.assertIn('iifname "wlan0" reject', n)
+
+    def test_no_port_is_advertised_that_nothing_listens_on(self):
+        # The portal binds 80. 8080 was open to students with nothing behind it.
+        self.assertEqual(POLICY["server_ports"], [80])
 
     def test_allowlist_adds_nat_and_addressed_egress_only(self):
         n = ap.render(policy(profile="allowlist", passphrase="s3cret",
