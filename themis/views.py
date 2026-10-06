@@ -454,10 +454,58 @@ button[disabled]{opacity:.4; cursor:not-allowed; filter:none}
 .badge.up{color:var(--ok)} .badge.downb{color:var(--muted)}
 .working{display:none; font-size:.85rem; color:var(--gold); margin-top:.6rem}
 .working.on{display:block}
+
+/* --- radios, one card each: a single station count cannot say whether BOTH
+       bands came up, and a dead 2.4 GHz side is invisible in a total. --- */
+.radios{display:grid; gap:.5rem; margin:.6rem 0 0}
+.radio{display:flex; align-items:center; gap:.7rem; padding:.6rem .8rem;
+  border:1px solid var(--line); border-radius:8px; background:var(--bg);
+  font-size:.88rem}
+.radio .band{font-family:ui-monospace,Menlo,monospace; font-weight:600;
+  color:var(--gold); min-width:4.2rem}
+.radio .iface{font-family:ui-monospace,Menlo,monospace; color:var(--muted);
+  min-width:4rem}
+.radio .dot{width:.5rem; height:.5rem; border-radius:50%; background:var(--muted)}
+.radio.on .dot{background:var(--ok)}
+.radio .sta{margin-left:auto; color:var(--muted); font-size:.82rem}
+
+/* --- mode: three genuinely different guarantees, not three settings --- */
+.modes{display:grid; gap:.5rem; margin:.4rem 0 0}
+.mode{text-align:left; display:block; width:100%; padding:.75rem .9rem;
+  border:1px solid var(--line); border-radius:8px; background:var(--bg);
+  color:var(--ink); cursor:pointer; font:inherit}
+.mode:hover{border-color:var(--gold)}
+.mode.sel{border-color:var(--gold); background:var(--gold-soft)}
+.mode b{display:block; font-size:.95rem; margin-bottom:.15rem}
+.mode span{display:block; color:var(--muted); font-size:.82rem; line-height:1.45}
+.mode.sel span{color:var(--ink)}
+
+textarea{width:100%; min-height:9rem; font:.84rem/1.5 ui-monospace,Menlo,monospace;
+  padding:.7rem .85rem; border-radius:8px; color:var(--ink); background:var(--bg);
+  border:1px solid var(--line); resize:vertical}
+textarea:focus{outline:none; border-color:var(--gold)}
+
+/* --- refusals: the discovery tool. A site the exam needs announces itself
+       here the first time a student hits it. --- */
+table.ref{width:100%; border-collapse:collapse; font-size:.84rem; margin:.5rem 0 0}
+table.ref th{text-align:left; font-weight:600; color:var(--muted); font-size:.78rem;
+  padding:.3rem .5rem; border-bottom:1px solid var(--line)}
+table.ref td{padding:.32rem .5rem; border-bottom:1px solid var(--line);
+  vertical-align:middle}
+table.ref td.host{font-family:ui-monospace,Menlo,monospace; word-break:break-all}
+table.ref td.n{color:var(--muted); text-align:right; font-variant-numeric:tabular-nums}
+table.ref td.act{text-align:right; white-space:nowrap}
+table.ref tr.allowed td.host{color:var(--ok)}
+.btn2{font:inherit; font-size:.78rem; padding:.25rem .6rem; border-radius:6px;
+  background:var(--panel); color:var(--ink); border:1px solid var(--line);
+  cursor:pointer}
+.btn2:hover{border-color:var(--gold); color:var(--gold)}
+.empty{color:var(--muted); font-size:.85rem; margin:.6rem 0 0}
 """
 
 OPERATOR_JS = """
 let busy = false;
+let editing = {allow:false, block:false};
 
 function esc(s){ const d=document.createElement('div'); d.textContent=s==null?'':s; return d.innerHTML; }
 
@@ -470,46 +518,107 @@ function checks(pf){
     + '</ul>';
 }
 
+const MODES = [
+  ['airgap', 'Air-gapped',
+   'No uplink at all. Online lookup, cloud AI, VPN and Tor are not filtered \u2014 they are unreachable. The exam must be served from this machine. The only mode that can prove rather than claim.'],
+  ['allowlist', 'Allowlist \u2014 only these sites work',
+   'Everything else is refused instantly. Matched by NAME, so it survives the CDN rotating and cannot be reached by aiming at an allowed address with a different SNI. Use this when the quiz lives in cloud Canvas.'],
+  ['blocklist', 'Blocklist \u2014 the web works except these',
+   'Much weaker: a site you did not think of is a site that works, and that includes every AI front-end launched between now and the exam. Use it for an open-book paper, not a closed one.'],
+];
+
+function radios(s){
+  if (!s.radios || !s.radios.length) return '<p class="empty">No radio configured yet.</p>';
+  return '<div class="radios">' + s.radios.map(r =>
+    `<div class="radio ${r.running?'on':''}"><span class="dot"></span>`
+    + `<span class="band">${esc(r.band)} GHz</span>`
+    + `<span class="iface">${esc(r.interface)}</span>`
+    + `<span>ch ${esc(r.channel)} \u00b7 ${esc(r.width)} MHz</span>`
+    + `<span class="sta">${r.running ? esc(r.stations.length)+' station(s)' : 'not running'}</span>`
+    + `</div>`).join('') + '</div>';
+}
+
+function refusals(s){
+  const rows = s.refusals || [];
+  if (!s.proxy_running) return '<p class="empty">The proxy is not running, so nothing is being refused yet.</p>';
+  if (!rows.length) return '<p class="empty">Nothing refused yet.</p>';
+  return '<table class="ref"><thead><tr><th>name a student asked for</th>'
+    + '<th style="text-align:right">tries</th><th>last</th><th></th></tr></thead><tbody>'
+    + rows.map(r =>
+      `<tr class="${r.on_allow?'allowed':''}"><td class="host">${esc(r.host)}</td>`
+      + `<td class="n">${esc(r.count)}</td>`
+      + `<td class="n">${esc((r.last||'').slice(11))}</td>`
+      + `<td class="act">${r.on_allow ? '<span class="sta">allowed</span>'
+          : `<button class="btn2" data-allow="${esc(r.host)}">Allow this</button>`}</td></tr>`
+    ).join('') + '</tbody></table>';
+}
+
 function render(s){
   const pol = s.policy, pf = s.preflight;
-  const configured = !!pol.interface && pol.passphrase_set;
+  const configured = !!(s.radios && s.radios.length && s.radios[0].interface) && pol.passphrase_set;
   const live = s.ap_running && s.portal_running;
+  const mode = s.mode;
+  const listed = mode === 'blocklist' ? 'block' : 'allow';
 
-  // Step 1 -- host checks
   const s1 = document.getElementById('s1');
   s1.className = 'step ' + (pf.ready ? 'done' : 'blocked');
   document.getElementById('s1body').innerHTML = checks(pf) +
     (pf.ready ? '' : '<p class="note" style="margin:.8rem 0 0">Fix the items above, then re-check. '
       + 'Each one is something that would otherwise surface during the exam.</p>');
 
-  // Step 2 -- network
   const s2 = document.getElementById('s2');
   s2.className = 'step ' + (configured ? 'done' : (pf.ready ? 'now' : ''));
-  const opts = s.interfaces.length
-    ? s.interfaces.map(i => `<option value="${esc(i.name)}" ${i.name===pol.interface?'selected':''}>`
-        + `${esc(i.name)} — ${esc(i.driver)}${i.preferred?' (recommended)':''}</option>`).join('')
-    : '<option value="">no wireless adapter found</option>';
-  document.getElementById('ifsel').innerHTML = opts;
-  document.getElementById('s2info').innerHTML = configured
+  document.getElementById('s2body').innerHTML = radios(s) + (configured
     ? `<dl class="kv"><dt>network</dt><dd>${esc(pol.ssid)}</dd>`
       + `<dt>password</dt><dd>${esc(pol.passphrase)}</dd>`
-      + `<dt>adapter</dt><dd>${esc(pol.interface)}</dd>`
-      + `<dt>channel</dt><dd>${esc(pol.channel)}</dd></dl>`
+      + (pol.bridge ? `<dt>bridge</dt><dd>${esc(pol.bridge)} \u2014 both bands are one network</dd>` : '')
+      + `</dl>`
       + '<p class="note" style="margin:.6rem 0 0">Write the password on the board. '
-      + 'It changes every time you press Set up, which is the point.</p>'
-    : '<p class="note" style="margin:.6rem 0 0">Not set up yet.</p>';
+      + 'Detect again after plugging in another adapter: one radio can only beacon on '
+      + 'one band, so two bands needs two of them.</p>'
+    : '<p class="note" style="margin:.6rem 0 0">Not set up yet. Detect adapters to begin.</p>');
 
-  // Step 3 -- run
   const s3 = document.getElementById('s3');
-  s3.className = 'step ' + (live ? 'done' : (configured && pf.ready ? 'now' : ''));
-  document.getElementById('runbadge').className = 'badge ' + (live ? 'up' : 'downb');
-  document.getElementById('runbadge').textContent = live ? 'exam network is up' : 'stopped';
+  s3.className = 'step ' + (mode ? 'done' : '');
+  document.getElementById('modes').innerHTML = MODES.map(([k,t,d]) =>
+    `<button class="mode ${mode===k?'sel':''}" data-mode="${k}"><b>${esc(t)}</b><span>${esc(d)}</span></button>`
+  ).join('') + (mode === 'allowlist-legacy'
+    ? '<p class="note">This policy uses the older address-based allowlist. It filters '
+      + 'ADDRESSES, which go stale when a CDN rotates and can be reached with a '
+      + 'different SNI. Pick Allowlist above to switch to name matching.</p>' : '');
+
+  const s4 = document.getElementById('s4');
+  const names = listed === 'block' ? (s.block||[]) : (s.allow||[]);
+  s4.style.display = (mode === 'airgap') ? 'none' : 'block';
+  document.getElementById('s4title').textContent = listed === 'block'
+    ? 'Sites to block' : 'Sites students may reach';
+  document.getElementById('s4hint').textContent = listed === 'block'
+    ? 'One name per line. Subdomains are included. Everything not listed here works.'
+    : 'One name per line. Subdomains are included. Everything not listed here is refused instantly. Paste a whole URL if it is easier \u2014 it is reduced to the hostname.';
+  const ta = document.getElementById('listbox');
+  // The newline below is written as a DOUBLED backslash on purpose. This block
+  // is an ordinary Python string, so a single backslash escape is consumed at
+  // import time and arrives here as a real line break inside a JavaScript
+  // string literal -- a syntax error that takes the whole panel down, leaving
+  // every dynamic section blank with one message in the console.
+  if (!editing[listed]) ta.value = names.join('\\n') + (names.length ? '\\n' : '');
+  ta.dataset.which = listed;
+
+  const s5 = document.getElementById('s5');
+  s5.className = 'step ' + (live ? 'done' : (configured && pf.ready ? 'now' : ''));
+  const rb = document.getElementById('runbadge');
+  rb.className = 'badge ' + (live ? 'up' : 'downb');
+  rb.textContent = live ? 'exam network is up' : 'stopped';
   document.getElementById('startbtn').disabled = busy || live || !configured || !pf.ready;
   document.getElementById('stopbtn').disabled  = busy || !(s.ap_running || s.portal_running);
-  document.getElementById('cfgbtn').disabled   = busy || live || !s.interfaces.length;
+  document.getElementById('detect').disabled   = busy || live;
+  document.getElementById('rotate').disabled   = busy || live;
   document.getElementById('recheck').disabled  = busy;
-  document.getElementById('s3links').style.display = live ? 'flex' : 'none';
+  document.getElementById('savelist').disabled = busy;
+  document.getElementById('s5links').style.display = live ? 'flex' : 'none';
   document.getElementById('console').href = 'http://127.0.0.1:' + s.console_port + '/';
+
+  document.getElementById('refusals').innerHTML = refusals(s);
 
   const out = document.getElementById('out');
   if (s.last && s.last.action){
@@ -520,31 +629,52 @@ function render(s){
 }
 
 async function refresh(){
-  const r = await fetch('/api/state', {cache:'no-store'});
-  render(await r.json());
+  try{
+    const r = await fetch('/api/state', {cache:'no-store'});
+    render(await r.json());
+  }catch(e){ /* the next tick will try again */ }
 }
 
-async function act(action, extra){
+async function act(action, extra, note){
   if (busy) return;
   busy = true;
-  document.getElementById('working').classList.add('on');
-  document.getElementById('working').textContent =
-    action === 'start_exam' ? 'Starting the radio, DHCP, DNS, firewall and portal…'
-    : action === 'stop_exam' ? 'Stopping the exam and restoring this host…'
-    : 'Working…';
+  const w = document.getElementById('working');
+  w.classList.add('on');
+  w.textContent = note || 'Working\u2026';
   try{
     await fetch('/api/action', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify(Object.assign({action}, extra||{}))});
-  }catch(e){ /* the refresh below will show the real state */ }
+  }catch(e){ /* the refresh below shows the real state */ }
   busy = false;
-  document.getElementById('working').classList.remove('on');
+  w.classList.remove('on');
+  editing = {allow:false, block:false};
   await refresh();
 }
 
-document.getElementById('cfgbtn').onclick   = () => act('configure', {interface: document.getElementById('ifsel').value});
-document.getElementById('startbtn').onclick = () => act('start_exam');
-document.getElementById('stopbtn').onclick  = () => act('stop_exam');
+document.getElementById('detect').onclick   = () => act('autoconfigure', null,
+  'Detecting adapters and assigning bands\u2026');
+document.getElementById('rotate').onclick   = () => act('rotate_passphrase', null,
+  'Generating a new password\u2026');
+document.getElementById('startbtn').onclick = () => act('start_exam', null,
+  'Starting the radios, DHCP, DNS, firewall, proxy and portal\u2026');
+document.getElementById('stopbtn').onclick  = () => act('stop_exam', null,
+  'Stopping the exam and restoring this host\u2026');
 document.getElementById('recheck').onclick  = () => refresh();
+document.getElementById('savelist').onclick = () => {
+  const ta = document.getElementById('listbox');
+  act('set_list', {which: ta.dataset.which, text: ta.value},
+      'Saving the list and reloading the proxy\u2026');
+};
+document.getElementById('listbox').oninput = (e) => { editing[e.target.dataset.which] = true; };
+document.getElementById('modes').onclick = (e) => {
+  const b = e.target.closest('[data-mode]');
+  if (b) act('set_mode', {mode: b.dataset.mode}, 'Switching mode\u2026');
+};
+document.getElementById('refusals').onclick = (e) => {
+  const b = e.target.closest('[data-allow]');
+  if (b) act('allow_name', {host: b.dataset.allow},
+             'Adding ' + b.dataset.allow + ' and reloading the proxy\u2026');
+};
 
 refresh();
 setInterval(() => { if (!busy) refresh(); }, 5000);
@@ -561,7 +691,7 @@ def operator_page() -> str:
 </head><body><div class="wrap">
 
 <h1>Set up the exam</h1>
-<p class="sub">Three steps. Nothing to type.</p>
+<p class="sub">Nothing to type, and nothing here looks at a student's machine.</p>
 
 <div class="step" id="s1">
   <h3><span class="num">1</span> This computer
@@ -572,34 +702,62 @@ def operator_page() -> str:
 </div>
 
 <div class="step" id="s2">
-  <h3><span class="num">2</span> The exam network</h3>
-  <p class="h">Pick the Wi-Fi adapter. A new password is generated each time.</p>
+  <h3><span class="num">2</span> The Wi-Fi</h3>
+  <p class="h">Detect finds every adapter, checks which bands it may legally
+    beacon on, and assigns one to 2.4 GHz and one to 5 GHz under a single network name.</p>
   <div class="row">
-    <select id="ifsel"></select>
-    <button id="cfgbtn" class="ghost">Set up</button>
+    <button id="detect" class="ghost">Detect adapters</button>
+    <button id="rotate" class="ghost">New password</button>
   </div>
-  <div id="s2info"></div>
+  <div id="s2body"></div>
 </div>
 
 <div class="step" id="s3">
-  <h3><span class="num">3</span> Run it <span class="badge downb" id="runbadge">stopped</span></h3>
-  <p class="h">Starts the radio, DHCP, DNS, the firewall and the sign-in page together.</p>
+  <h3><span class="num">3</span> What students may reach</h3>
+  <p class="h">Three different guarantees, not three settings of one.</p>
+  <div class="modes" id="modes"></div>
+</div>
+
+<div class="step" id="s4">
+  <h3><span class="num">4</span> <span id="s4title">The list</span></h3>
+  <p class="h" id="s4hint"></p>
+  <textarea id="listbox" spellcheck="false"></textarea>
+  <div class="row">
+    <button id="savelist" class="ghost">Save the list</button>
+  </div>
+  <p class="note">Saving reloads the proxy in place. Nobody is disconnected, so a
+    missing site can be added during an exam.</p>
+</div>
+
+<div class="step" id="s5">
+  <h3><span class="num">5</span> Run it <span class="badge downb" id="runbadge">stopped</span></h3>
+  <p class="h">Starts the radios, DHCP, DNS, the firewall, the proxy and the sign-in page together.</p>
   <div class="row">
     <button id="startbtn" class="big">Start the exam</button>
     <button id="stopbtn" class="big danger">Stop the exam</button>
   </div>
-  <div class="row" id="s3links" style="display:none">
+  <div class="row" id="s5links" style="display:none">
     <a class="btn2" id="console" href="#" target="_blank">Open the proctor console</a>
   </div>
   <div class="working" id="working"></div>
 </div>
 
+<div class="step">
+  <h3>Refused so far</h3>
+  <p class="h">What students' devices actually asked for and did not get. A site
+    the exam genuinely needs shows up here the first time someone hits it, which
+    is how the list gets built from real traffic instead of guesswork.</p>
+  <div id="refusals"></div>
+</div>
+
 <div class="out" id="out" style="display:none"></div>
 
 <hr class="rule">
-<p class="note">While the exam network is up this computer has no internet access.
-That is not a fault — it is the reason a VPN or Tor cannot work from a student's
-laptop. Stopping the exam gives this machine its network and its firewall back.</p>
+<p class="note">Three things are not blocked by any of this and cannot be: a phone
+on cellular, a local AI model on a student's own laptop, and collusion inside a
+site you have allowed. Jamming the first is illegal, the second emits no packets,
+and the third is carried inside a connection you deliberately permitted. Oral
+spot-checks are the control that covers all three.</p>
 <p class="foot">Themis · this panel is reachable only from this machine</p>
 
 <script>{OPERATOR_JS}</script>

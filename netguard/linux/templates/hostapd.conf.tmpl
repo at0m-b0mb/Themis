@@ -2,6 +2,10 @@
 # Profile: {{PROFILE}}   Rendered: {{STAMP}}
 
 interface={{AP_IF}}
+# With two radios every AP is a port on one bridge, so a 2.4 GHz student and a
+# 5 GHz student share one subnet, one DHCP server and one portal -- they see a
+# single network and their device picks the band.
+{{BRIDGE_LINE}}
 driver=nl80211
 
 ssid={{SSID}}
@@ -11,18 +15,10 @@ country_code={{COUNTRY}}
 ieee80211d=1
 
 # --- Radio ------------------------------------------------------------------
-# 5 GHz. mt7921u does NOT support DFS channels in AP mode, so {{CHANNEL}} must
-# stay out of the DFS range -- themis-ap preflight enforces this.
-hw_mode=a
-channel={{CHANNEL}}
-
-ieee80211n=1
-ieee80211ac=1
-ieee80211ax=1
-wmm_enabled=1
-
-ht_capab=[HT40+][SHORT-GI-20][SHORT-GI-40]
-{{WIDTH_BLOCK}}
+# Band-dependent, and rendered rather than written here: hw_mode, the HT40
+# direction and whether VHT applies at all differ between 2.4 and 5 GHz, and a
+# fixed [HT40+] is simply wrong on half the legal channels.
+{{RADIO_BLOCK}}
 
 # --- Security ---------------------------------------------------------------
 auth_algs=1

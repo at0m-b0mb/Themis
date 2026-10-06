@@ -24,6 +24,7 @@ import os
 import re
 import secrets
 import pathlib
+import socket
 import shutil
 import subprocess
 import sys
@@ -33,12 +34,44 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATES = ROOT / "templates"
 POLICY = ROOT / "policy.json"
-RUN_DIR = Path("/run/themis")
+RUN_DIR = Path("/run/themis")           # ephemeral: pids, rendered configs, leases
+DATA_DIR = Path("/var/lib/themis")      # the exam record, which must survive a reboot
 STATE = RUN_DIR / "state.json"
-JOURNAL = RUN_DIR / "exam.jsonl"
+# The journal is the exam RECORD, not runtime state, and it must be the SAME file
+# every component writes to. It is a single hash chain: two writers on two paths
+# produce two chains, the console renders one of them, and the proctor is then
+# looking at half an exam without being told so. themis/state.py carries the
+# reasoning, and themis-sta-hook already imports ACTIVE_JOURNAL from there -- this
+# had drifted to /run, which is also where the record used to evaporate on reboot.
+JOURNAL = DATA_DIR / "exam.jsonl"
 
 # mt7921u will not run an AP on a DFS channel. US non-DFS 5 GHz channels:
 NON_DFS_5GHZ = {36, 40, 44, 48, 149, 153, 157, 161, 165}
+# 2.4 GHz. Only 1, 6 and 11 are non-overlapping; anything else guarantees
+# adjacent-channel interference with whatever else is in the building.
+CLEAN_24GHZ = {1, 6, 11}
+USABLE_24GHZ = set(range(1, 12))          # 12-14 are not usable in the US
+
+# An 80 MHz block is four 20 MHz channels wide and is named by its centre. The
+# blocks do not sit on a regular grid -- 149-161 centres on 155, not 154 -- so
+# this is a table rather than arithmetic, because the arithmetic version is
+# wrong for exactly the band we are most likely to use.
+VHT80_CENTRE = {}
+for _group, _centre in (((36, 40, 44, 48), 42), ((52, 56, 60, 64), 58),
+                        ((100, 104, 108, 112), 106), ((116, 120, 124, 128), 122),
+                        ((132, 136, 140, 144), 138), ((149, 153, 157, 161), 155)):
+    for _ch in _group:
+        VHT80_CENTRE[_ch] = _centre
+
+# HT40 pairs a channel with a neighbour either above it (+) or below it (-).
+# Declaring the wrong direction makes hostapd refuse the channel outright, so
+# this cannot be hardcoded to [HT40+] the way it was.
+HT40_PLUS_5GHZ = {36, 44, 52, 60, 100, 108, 116, 124, 132, 140, 149, 157}
+HT40_MINUS_5GHZ = {40, 48, 56, 64, 104, 112, 120, 128, 136, 144, 153, 161}
+# 165 sits alone at the top of the US band with no 40 MHz partner.
+WIDTH20_ONLY_5GHZ = {165}
+
+DEFAULT_BRIDGE = "br-themis"
 # AP mode for mt7921u landed in 5.19.
 MIN_KERNEL = (5, 19)
 # The Bluetooth side of an MT7921AU crashes its Wi-Fi side on 6.6+.
@@ -66,6 +99,47 @@ ASSURANCE = {
         ("Local AI model on their laptop", "NOT BLOCKED", "runs offline, emits no traffic"),
         ("Phone on cellular", "NOT BLOCKED", "never touches this network"),
         ("Leaving for another network", "DETECTED AT THE RADIO", "hostapd reports the disassociation"),
+    ],
+    "proxy": [
+        ("Online answer lookup", "ALL BUT THE ALLOWLIST",
+         "every name except the allowlist is refused by the proxy, and refused by "
+         "NAME -- so it does not go stale when the CDN rotates and cannot be "
+         "sidestepped by aiming at an allowed address with a different SNI"),
+        ("Cloud AI (ChatGPT, Claude, Gemini)", "BLOCKED",
+         "their names are not on the allowlist; there is no address to pin and no "
+         "address to miss"),
+        ("Commercial VPN", "BLOCKED",
+         "its name is not allowlisted, and its UDP transport is refused outright"),
+        ("Self-hosted VPN, any port", "BLOCKED",
+         "no student packet is ever forwarded -- ip_forward stays 0 and the forward "
+         "chain is empty. The only process that egresses is the proxy, and it "
+         "connects to a name it resolves itself, so an arbitrary address is "
+         "unreachable even on port 443"),
+        ("VPN over TLS on 443 with a forged SNI", "BLOCKED",
+         "the proxy discards the client's destination and resolves the allowlisted "
+         "name itself, so claiming to be Canvas reaches Canvas, not the relay"),
+        ("Tor", "BLOCKED",
+         "a bridge is an arbitrary address, and nothing but the proxy can egress"),
+        ("DNS tunnelling", "IMPOSSIBLE",
+         "the resolver runs no-resolv: no upstream, so no exit, and port 53 "
+         "elsewhere is refused"),
+        ("DoH / DoT", "BLOCKED",
+         "853 is refused, and DoH over 443 fails the SNI check like anything else"),
+        ("Student-to-student", "BLOCKED BY THE RADIO",
+         "hostapd ap_isolate, plus a bridge-family drop so it holds between the "
+         "two bands as well. Within one radio the firewall still does not back it "
+         "up: two clients of the same AP are relayed inside the radio at layer 2 "
+         "and never reach any IP hook"),
+        ("Collusion through the allowlisted site itself", "NOT BLOCKED",
+         "Canvas's own Inbox and discussions are a student-to-student channel "
+         "carried inside a connection we deliberately permit -- no network control "
+         "can see it, and oral spot-checks are what catch it"),
+        ("Local AI model on their laptop", "NOT BLOCKED",
+         "runs offline, emits no traffic -- invisible to any network control"),
+        ("Phone on cellular", "NOT BLOCKED",
+         "never touches this network -- a human in the room is the only control"),
+        ("Leaving for another network", "DETECTED AT THE RADIO",
+         "hostapd reports the disassociation; blocking it would be illegal"),
     ],
 }
 
@@ -133,16 +207,75 @@ def loaded_modules() -> set[str]:
         return set()
 
 
-def supports_ap(iface: str) -> bool | None:
-    """True/False from `iw list`, or None if we could not tell."""
-    phy = Path(f"/sys/class/net/{iface}/phy80211")
-    if not phy.exists():
+def iface_phy(iface: str) -> str | None:
+    """The wiphy name ('phy0') behind an interface, or None if it has no radio."""
+    try:
+        return Path(f"/sys/class/net/{iface}/phy80211/name").read_text().strip()
+    except OSError:
         return None
-    text = out(["iw", "list"])
+
+
+def _phy_info(iface: str) -> str:
+    """`iw phy <phy> info` for THIS radio.
+
+    Deliberately per-phy. A global `iw list` concatenates every adapter, and the
+    first match in it belongs to whichever phy was printed first -- so with two
+    adapters every question about the second one was being answered with the
+    first one's capabilities. Identical adapters hide that; a 2.4-only second
+    adapter would not, and the answer would be confidently wrong.
+    """
+    phy = iface_phy(iface)
+    return out(["iw", "phy", phy, "info"]) if phy else ""
+
+
+def supports_ap(iface: str) -> bool | None:
+    """True/False for this radio, or None if we could not tell."""
+    text = _phy_info(iface)
     if not text:
         return None
     block = re.search(r"Supported interface modes:(.*?)(?:\n\s*\w[\w ]*:|\Z)", text, re.S)
     return ("* AP" in block.group(1)) if block else None
+
+
+def _channel_lines(iface: str):
+    """Yield (freq_mhz, channel, flags) for every channel this radio lists.
+
+    Frequency is what identifies the band, not the channel number: 6 GHz reuses
+    the numbers 1 and 149, so matching on the number alone can answer a question
+    about 2.4 GHz channel 1 with a 6 GHz entry that is disabled.
+    """
+    for m in re.finditer(r"^\s*\* (\d{4})(?:\.\d+)? MHz \[(\d+)\](.*)$",
+                         _phy_info(iface), re.M):
+        yield int(m.group(1)), int(m.group(2)), m.group(3)
+
+
+def _band_of_freq(freq: int) -> str | None:
+    if 2400 <= freq <= 2500:
+        return "2.4"
+    if 5100 <= freq <= 5900:
+        return "5"
+    return None                                  # 6 GHz and 60 GHz: not used here
+
+
+def usable_channels(iface: str) -> dict[str, list[int]]:
+    """Channels this radio may actually BEACON on, grouped by band.
+
+    'no IR', 'disabled' and radar/DFS channels are all excluded, because each of
+    them is listenable but not usable for an AP -- and picking one produces a
+    hostapd failure at `up` rather than anything an operator can act on.
+    """
+    got: dict[str, list[int]] = {"2.4": [], "5": []}
+    for freq, ch, flags in _channel_lines(iface):
+        band = _band_of_freq(freq)
+        if band is None:
+            continue
+        if "disabled" in flags or "no IR" in flags or "radar detection" in flags:
+            continue
+        if band == "2.4" and ch in USABLE_24GHZ:
+            got["2.4"].append(ch)
+        elif band == "5" and ch in NON_DFS_5GHZ:
+            got["5"].append(ch)
+    return {b: sorted(set(v)) for b, v in got.items() if v}
 
 
 def nm_manages(iface: str) -> bool:
@@ -186,16 +319,209 @@ def bt_blacklisted() -> bool:
     return False
 
 
-def centre_index(channel: int, width: int) -> int:
+def band_of(channel: int) -> str:
+    """'2.4' or '5'. Channel numbers restart per band, so this is by range."""
+    return "2.4" if channel <= 14 else "5"
+
+
+def effective_width(channel: int, width: int) -> int:
+    """The width we can actually use on this channel, which is not always the
+    width that was asked for.
+
+    Asking for 80 MHz on channel 165, or on 2.4 GHz at all, is not a
+    misconfiguration an operator would spot -- it is a hostapd startup failure
+    at `up` time. Clamping here, and saying so in preflight, is the difference
+    between a narrower channel and no exam network.
+    """
+    if band_of(channel) == "2.4":
+        return 40 if width >= 40 else 20          # no VHT80 on 2.4 GHz, ever
+    if channel in WIDTH20_ONLY_5GHZ:
+        return 20
     if width >= 80:
-        base = 36 if channel <= 48 else 149
-        return base + 6
-    if width == 40:
-        return channel + 2
+        return 80 if channel in VHT80_CENTRE else 20
+    return 40 if width == 40 else 20
+
+
+def ht40_direction(channel: int) -> str | None:
+    """'+', '-', or None when this channel has no legal 40 MHz partner."""
+    if band_of(channel) == "2.4":
+        # The partner is 4 channels away and must stay inside 1-11.
+        if channel + 4 <= 11:
+            return "+"
+        return "-" if channel - 4 >= 1 else None
+    if channel in HT40_PLUS_5GHZ:
+        return "+"
+    if channel in HT40_MINUS_5GHZ:
+        return "-"
+    return None
+
+
+def ht_capab(channel: int, width: int) -> str:
+    caps = ["[SHORT-GI-20]"]
+    if effective_width(channel, width) >= 40:
+        d = ht40_direction(channel)
+        if d:
+            caps.insert(0, f"[HT40{d}]")
+            caps.append("[SHORT-GI-40]")
+    return "".join(caps)
+
+
+def centre_index(channel: int, width: int) -> int:
+    """The centre channel index hostapd wants for the operating width."""
+    w = effective_width(channel, width)
+    if w >= 80:
+        return VHT80_CENTRE[channel]
+    if w == 40:
+        d = ht40_direction(channel)
+        if d == "+":
+            return channel + 2
+        if d == "-":
+            return channel - 2
     return channel
 
 
+def channel_freq_mhz(channel: int) -> int:
+    """Channel number -> centre frequency in MHz, for whichever band it is in.
+
+    The two bands number their channels independently and space them
+    differently, so a single formula is wrong for one of them. Getting this
+    wrong does not raise -- the "can we legally beacon here" lookup simply
+    finds no matching line and reports "could not tell", which is the silent
+    pass this check exists to prevent.
+    """
+    if channel <= 14:
+        return 2484 if channel == 14 else 2407 + channel * 5
+    return 5000 + channel * 5
+
+
+def regdomain() -> str | None:
+    """The country code cfg80211 is actually enforcing, or None if unreadable.
+
+    Not the same thing as policy.json's country_code: that is what we ASK hostapd
+    for, this is what the kernel will ALLOW. When they disagree, the kernel wins.
+    """
+    m = re.search(r"country ([A-Z0-9]{2}):", out(["iw", "reg", "get"]))
+    return m.group(1) if m else None
+
+
+def channel_no_ir(iface: str, channel: int) -> bool | None:
+    """Is this channel barred from *initiating* radiation, i.e. from beaconing?
+
+    Such channels are marked "(no IR)": they may be listened on but not
+    transmitted on unprompted, which is exactly what a beacon is. hostapd reports
+    this as a bare nl80211 failure at `up` time, with students already in the
+    room, so it belongs in preflight. None means we could not tell.
+    """
+    want = channel_freq_mhz(channel)
+    for freq, ch, flags in _channel_lines(iface):
+        if freq == want and ch == channel:
+            return ("no IR" in flags) or ("disabled" in flags)
+    return None
+
+
+def channel_power_dbm(iface: str, channel: int) -> float | None:
+    """The regulatory TX-power ceiling for this channel on this radio.
+
+    The ceiling, not the current setting. `iw dev` reports whatever the radio last
+    used, which at preflight time -- interface down, hostapd not started -- is a
+    number about nothing. The ceiling is what decides whether a laptop at the back
+    of the room can hear the beacon, and it is readable while the radio is down.
+    """
+    want = channel_freq_mhz(channel)
+    for freq, ch, flags in _channel_lines(iface):
+        if freq == want and ch == channel:
+            m = re.search(r"\(([\d.]+) dBm\)", flags)
+            return float(m.group(1)) if m else None
+    return None
+
+
 # --------------------------------------------------------------------------- #
+
+def radios_of(pol: dict) -> list[dict]:
+    """Every radio this AP runs, normalised to a list.
+
+    One adapter beacons on one channel, so "2.4 GHz and 5 GHz at the same time"
+    is not a setting -- it is two radios. That is also all a dual-band router is:
+    two of them in one box. `radios` is the list form; `ap_interface` stays the
+    single-radio spelling so existing policies and the tests keep working.
+    """
+    raw = pol.get("radios")
+    if raw:
+        return [{
+            "interface": r["interface"],
+            "channel": int(r.get("channel", pol.get("channel", 6))),
+            "channel_width_mhz": int(r.get("channel_width_mhz",
+                                           pol.get("channel_width_mhz", 20))),
+        } for r in raw]
+    return [{"interface": pol["ap_interface"],
+             "channel": int(pol["channel"]),
+             "channel_width_mhz": int(pol.get("channel_width_mhz", 80))}]
+
+
+def bridge_of(pol: dict) -> str | None:
+    """The bridge the radios share, or None when there is only one radio.
+
+    Two radios have to land in ONE broadcast domain or a 2.4 GHz student and a
+    5 GHz student are on separate networks with a single DHCP server between
+    them. A lone radio needs no bridge, and not making one leaves that path
+    byte-for-byte as it was already tested.
+    """
+    return pol.get("bridge", DEFAULT_BRIDGE) if len(radios_of(pol)) > 1 else None
+
+
+def student_iface(pol: dict) -> str:
+    """The interface students actually arrive on: the bridge, or the one radio.
+    Every nftables rule matches on this, and dnsmasq binds it."""
+    return bridge_of(pol) or radios_of(pol)[0]["interface"]
+
+
+def _radio_block(channel: int, width: int) -> str:
+    """The band-dependent half of a hostapd config.
+
+    This used to be hardcoded to 5 GHz with a fixed [HT40+], which is wrong on
+    channels 40/48/153/161 (their 40 MHz partner is below, not above) and wrong
+    on all of 2.4 GHz. Both spellings make hostapd refuse the channel.
+    """
+    w = effective_width(channel, width)
+    caps = ht_capab(channel, width)
+    if band_of(channel) == "2.4":
+        return (
+            "# 2.4 GHz. Every Wi-Fi device ever built can see this band, which is the\n"
+            "# entire reason to run it: a student whose laptop cannot find the network\n"
+            "# is a student who cannot sit the exam. VHT (802.11ac) is 5 GHz only, so\n"
+            "# it is off here rather than set and ignored.\n"
+            "hw_mode=g\n"
+            f"channel={channel}\n"
+            "\n"
+            "ieee80211n=1\n"
+            "ieee80211ac=0\n"
+            "ieee80211ax=1\n"
+            "wmm_enabled=1\n"
+            "\n"
+            f"ht_capab={caps}\n"
+            f"# operating width {w} MHz\n"
+        )
+    chw = 1 if w >= 80 else 0
+    seg = centre_index(channel, width)
+    return (
+        "# 5 GHz. mt7921u does NOT support DFS channels in AP mode, so this channel\n"
+        "# must stay out of the DFS range -- themis-ap preflight enforces that.\n"
+        "hw_mode=a\n"
+        f"channel={channel}\n"
+        "\n"
+        "ieee80211n=1\n"
+        "ieee80211ac=1\n"
+        "ieee80211ax=1\n"
+        "wmm_enabled=1\n"
+        "\n"
+        f"ht_capab={caps}\n"
+        f"vht_oper_chwidth={chw}\n"
+        f"vht_oper_centr_freq_seg0_idx={seg}\n"
+        f"he_oper_chwidth={chw}\n"
+        f"he_oper_centr_freq_seg0_idx={seg}\n"
+        f"# operating width {w} MHz\n"
+    )
+
 
 class EgressPolicyError(Exception):
     """allow_egress contains something nftables cannot safely express."""
@@ -238,22 +564,30 @@ def _check_egress_are_addresses(entries) -> None:
         )
 
 
+def _student_ports(pol: dict) -> list[int]:
+    """Local TCP ports a student may open, newest-first in intent.
+
+    In profile 'proxy' the name-validating proxy is a second local socket
+    students must reach, so it belongs here. Leaving it out produces a firewall
+    that redirects every HTTPS connection to a port nothing may talk to, and
+    every page in the exam hangs.
+    """
+    ports = [int(x) for x in pol.get("server_ports", [80])]
+    if pol.get("profile") == "proxy":
+        px = int(pol.get("proxy_port", 443))
+        if px not in ports:
+            ports.append(px)
+    return ports
+
+
 def render(pol: dict) -> dict[str, str]:
     stamp = time.strftime("%Y-%m-%d %H:%M:%S %Z")
-    prof, ap_if, srv = pol["profile"], pol["ap_interface"], pol["server_ip"]
-    width = int(pol.get("channel_width_mhz", 80))
-    ch = int(pol["channel"])
-
-    if width >= 80:
-        chw, seg = 1, centre_index(ch, 80)
-    else:
-        chw, seg = 0, centre_index(ch, width)
-    width_block = (
-        f"vht_oper_chwidth={chw}\n"
-        f"vht_oper_centr_freq_seg0_idx={seg}\n"
-        f"he_oper_chwidth={chw}\n"
-        f"he_oper_centr_freq_seg0_idx={seg}"
-    )
+    prof, srv = pol["profile"], pol["server_ip"]
+    radios = radios_of(pol)
+    bridge = bridge_of(pol)
+    # Every firewall rule and dnsmasq itself bind to where students ARRIVE, which
+    # with two radios is the bridge and not either radio.
+    ap_if = student_iface(pol)
 
     ent = pol.get("enterprise") or {}
     if ent.get("enabled"):
@@ -293,17 +627,42 @@ def render(pol: dict) -> dict[str, str]:
             + extra
         )
 
-    hostapd = (TEMPLATES / "hostapd.conf.tmpl").read_text()
-    for k, v in {
-        "PROFILE": prof, "STAMP": stamp, "AP_IF": ap_if, "SSID": pol["ssid"],
-        "COUNTRY": pol["country_code"], "CHANNEL": ch, "WIDTH_BLOCK": width_block,
-        "AUTH_BLOCK": auth_block,
-        "AP_ISOLATE": 1 if pol.get("client_isolation", True) else 0,
-        "MAX_STA": pol.get("max_stations", 25),
-    }.items():
-        hostapd = hostapd.replace("{{%s}}" % k, str(v))
+    tmpl = (TEMPLATES / "hostapd.conf.tmpl").read_text()
+    hostapd_files: dict[str, str] = {}
+    for radio in radios:
+        text = tmpl
+        for k, v in {
+            "PROFILE": prof, "STAMP": stamp,
+            "AP_IF": radio["interface"],
+            "BRIDGE_LINE": (f"bridge={bridge}" if bridge else
+                            "# one radio, so no bridge -- students arrive on it directly"),
+            "SSID": pol["ssid"], "COUNTRY": pol["country_code"],
+            "RADIO_BLOCK": _radio_block(radio["channel"], radio["channel_width_mhz"]),
+            "AUTH_BLOCK": auth_block,
+            "AP_ISOLATE": 1 if pol.get("client_isolation", True) else 0,
+            "MAX_STA": pol.get("max_stations", 25),
+        }.items():
+            text = text.replace("{{%s}}" % k, str(v))
+        # One radio keeps the original filename, so existing tooling and the test
+        # suite are untouched. Two or more are named after the radio they drive.
+        name = "hostapd.conf" if len(radios) == 1 else f"hostapd-{radio['interface']}.conf"
+        hostapd_files[name] = text
 
-    if prof == "allowlist":
+    if prof == "proxy":
+        # The guarantee here is an ABSENCE: nothing is forwarded, so no student
+        # packet ever leaves by routing. Everything that leaves is a connection
+        # the proxy opened to a name it checked and resolved itself. That is why
+        # a self-hosted VPN on an arbitrary address and port has nothing to talk
+        # to, and why ip_forward must stay 0 -- preflight enforces that.
+        forward_block = (
+            "    # Profile 'proxy': still nothing forwarded. Students reach exactly two\n"
+            "    # local sockets -- the portal on 80 and the name-validating proxy on\n"
+            "    # 443 -- and the proxy is the only thing on this host that egresses."
+        )
+        nat_table = ("\n  # Profile 'proxy': no postrouting chain. Students are not routed,\n"
+                     "  # so there is nothing to masquerade; the proxy egresses under the\n"
+                     "  # host's own address like any other local process.\n")
+    elif prof == "allowlist":
         up = pol["uplink_interface"]
         _check_egress_are_addresses(pol["allow_egress"])
         fwd = [f'    iifname "{ap_if}" oifname "{up}" ip daddr {{ {", ".join(pol["allow_egress"])} }} tcp dport {{ 80, 443 }} accept',
@@ -325,11 +684,62 @@ def render(pol: dict) -> dict[str, str]:
                      "  # uplink to translate to. The redirect above is the only\n"
                      "  # translation here, and it only ever points at this host.\n")
 
+    redirect = [
+        "    # Send ANY plain-HTTP request to the portal, whatever address it was aimed",
+        "    # at. Without this a browser holding a cached IP, or a student typing one,",
+        "    # bypasses the DNS sinkhole entirely and just hangs.",
+        f'    iifname "{ap_if}" tcp dport 80 ip daddr != {srv} dnat to {srv}',
+    ]
+    if prof == "proxy":
+        redirect += [
+            "",
+            "    # Same for HTTPS, and for the same reason: a cached address or a hardcoded",
+            "    # one must not be a way around the name check. Every 443 connection lands",
+            "    # on the proxy, which is the only thing that decides where it may go.",
+            f'    iifname "{ap_if}" tcp dport 443 ip daddr != {srv} dnat to {srv}',
+        ]
+    if prof in ("airgap", "proxy"):
+        redirect += [
+            "",
+            "    # Every OTHER off-network TCP port lands here too, and only so that the",
+            "    # refusal is INSTANT. With ip_forward=0 such a packet is discarded at the",
+            "    # routing stage with no reply at all, so an OpenVPN, SSH or Tor client sits",
+            "    # in a five-second connect timeout. It was blocked either way -- but a hang",
+            "    # is exactly what convinces a student the exam network is broken, which is",
+            "    # the failure this project keeps choosing to avoid. Sent here, the packet",
+            "    # meets the input chain's `reject with tcp reset` and dies in milliseconds.",
+            "    #",
+            "    # TCP only, deliberately. Redirecting UDP as well would hand every query",
+            "    # aimed at a public resolver to our own dnsmasq, which would answer it --",
+            "    # turning \"DNS to 8.8.8.8\" from refused into answered-by-the-sinkhole and",
+            "    # quietly destroying the one probe that can prove UDP egress is shut.",
+            f'    iifname "{ap_if}" meta l4proto tcp ip daddr != {srv} dnat to {srv}',
+        ]
+
+    if bridge:
+        bridge_table = (
+            "\n# Two radios in one bridge would otherwise undo client isolation: hostapd's\n"
+            "# ap_isolate only separates two students on the SAME radio, and a frame from\n"
+            "# the 2.4 GHz radio to the 5 GHz one is forwarded between bridge ports where\n"
+            "# ap_isolate never sees it. Dropping the bridge forward hook closes that.\n"
+            "# Frames addressed to the gateway itself are delivered locally through the\n"
+            "# bridge INPUT hook, not forwarded, so DHCP, ARP and the portal still work.\n"
+            "table bridge themis_iso {\n"
+            "  chain forward {\n"
+            "    type filter hook forward priority filter; policy drop;\n"
+            "  }\n"
+            "}\n"
+        )
+    else:
+        bridge_table = ("\n# One radio, so there is no bridge to isolate across and hostapd's\n"
+                        "# ap_isolate is the whole of client isolation.\n")
+
     nft = (TEMPLATES / "nftables.conf.tmpl").read_text()
     for k, v in {
         "PROFILE": prof, "STAMP": stamp, "AP_IF": ap_if, "NET": pol["network_cidr"],
-        "SRV": srv, "PORTS": ", ".join(str(p) for p in pol.get("server_ports", [80])),
+        "SRV": srv, "PORTS": ", ".join(str(p) for p in _student_ports(pol)),
         "FORWARD_BLOCK": forward_block, "NAT_POSTROUTING": nat_table,
+        "REDIRECT_BLOCK": "\n".join(redirect), "BRIDGE_TABLE": bridge_table,
     }.items():
         nft = nft.replace("{{%s}}" % k, str(v))
 
@@ -344,6 +754,18 @@ def render(pol: dict) -> dict[str, str]:
             "# those names resolve to -- see allow_egress.\n"
             + "".join(f"server=/{d}/1.1.1.1\n" for d in pol.get("allow_dns_names", []))
             + f"address=/#/{srv}\n"
+        )
+    elif prof == "proxy":
+        # Still a total sinkhole, even though some names ARE reachable. The client
+        # never needs the real address: it connects to us on 443 and the proxy
+        # decides, by name, where that goes. Keeping no upstream here is what
+        # keeps DNS tunnelling impossible rather than merely filtered, and it
+        # also means no HTTPS/SVCB record is ever served -- so Encrypted Client
+        # Hello cannot be negotiated and the SNI stays readable.
+        dns_body = (
+            "# Every name resolves to this host. Port 80 reaches the portal, port 443\n"
+            "# reaches the name-validating proxy, and nothing else is reachable at all.\n"
+            f"address=/#/{srv}\n"
         )
     else:
         dns_body = (
@@ -364,11 +786,12 @@ def render(pol: dict) -> dict[str, str]:
     }.items():
         dns = dns.replace("{{%s}}" % k, str(v))
 
-    return {"hostapd.conf": hostapd, "nftables.conf": nft, "dnsmasq.conf": dns}
+    return {**hostapd_files, "nftables.conf": nft, "dnsmasq.conf": dns}
 
 
 def write_rendered(pol: dict) -> dict[str, Path]:
     RUN_DIR.mkdir(parents=True, exist_ok=True)
+    JOURNAL.parent.mkdir(parents=True, exist_ok=True)
     paths = {}
     for name, text in render(pol).items():
         p = RUN_DIR / name
@@ -389,6 +812,319 @@ def wireless_interfaces() -> list[str]:
         if (iface / "phy80211").exists():
             out.append(iface.name)
     return out
+
+
+# A teacher types or pastes into a text box, and whatever comes out of it ends up
+# inside generated dnsmasq directives. A name containing a slash or a newline
+# would not be a bad hostname there -- it would be a new configuration line. So
+# this validates rather than escapes. No legitimate hostname is rejected by it.
+HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
+    r"(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")
+
+# What the teacher picks, and what it means in policy terms. The three are
+# genuinely different guarantees, not three settings of one.
+MODES = {
+    "airgap": {
+        "profile": "airgap", "proxy_mode": None,
+        "label": "Air-gapped",
+        "blurb": "No uplink at all. Online lookup, cloud AI, VPN and Tor are not "
+                 "filtered -- they are unreachable. The exam must be served locally. "
+                 "This is the only mode that can prove rather than merely claim.",
+    },
+    "allowlist": {
+        "profile": "proxy", "proxy_mode": "allow",
+        "label": "Allowlist",
+        "blurb": "Only the named sites work; everything else is refused instantly. "
+                 "Use this when the quiz lives in cloud Canvas.",
+    },
+    "blocklist": {
+        "profile": "proxy", "proxy_mode": "block",
+        "label": "Blocklist",
+        "blurb": "The web works except for the named sites. Much weaker -- a site "
+                 "you did not think of is a site that works -- but it is what an "
+                 "open-book exam needs.",
+    },
+}
+
+
+def mode_of(pol: dict) -> str:
+    """Which teacher-facing mode this policy is in.
+
+    'allowlist-legacy' is the old address-based profile, kept because it is
+    documented and someone may be relying on it, but it is not one of the three
+    a teacher should be choosing between -- see MODES.
+    """
+    prof = pol.get("profile")
+    if prof == "proxy":
+        return "blocklist" if pol.get("proxy_mode") == "block" else "allowlist"
+    if prof == "allowlist":
+        return "allowlist-legacy"
+    return "airgap"
+
+
+def clean_hostnames(raw) -> tuple[list[str], list[str]]:
+    """Split candidates into (accepted, rejected), normalising as we go.
+
+    A teacher will paste a whole URL out of the address bar, so a pasted
+    'https://jhu.instructure.com/courses/418' becomes 'jhu.instructure.com'
+    rather than an error message. Anything that still is not a hostname after
+    that is reported back rather than silently dropped -- a name the teacher
+    believes is blocked but that was quietly discarded is the worst outcome here.
+    """
+    ok: list[str] = []
+    bad: list[str] = []
+    seen: set[str] = set()
+    for item in raw or ():
+        original = str(item).strip()
+        if not original or original.startswith("#"):
+            continue
+        # An entry carrying a newline means the caller handed several lines in as
+        # one item. Normalising it would keep the first hostname and silently drop
+        # the rest, which is the one outcome this function promises not to produce:
+        # a name the teacher believes is on the list but which was discarded. It is
+        # also precisely the shape a dnsmasq-directive injection would take, so it
+        # is refused and reported rather than cleaned up.
+        if any(c in original for c in ("\n", "\r", "\x00")):
+            bad.append(original.replace("\n", "\\n").replace("\r", "\\r")[:80])
+            continue
+        name = original.lower()
+        for pre in ("https://", "http://", "//"):
+            name = name.removeprefix(pre)
+        name = name.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+        name = name.split("@")[-1]                 # user:pass@host
+        name = name.split(":", 1)[0]               # :port
+        name = name.lstrip("*").lstrip(".").rstrip(".")
+        if not name or name.startswith("_"):
+            continue
+        if not HOSTNAME_RE.match(name):
+            bad.append(original[:80])
+            continue
+        if name not in seen:
+            seen.add(name)
+            ok.append(name)
+    return ok, bad
+
+
+def _pick_channel(available: list[int], prefer: list[int]) -> int:
+    for c in prefer:
+        if c in available:
+            return c
+    return available[0]
+
+
+def plan_radios(ifaces: list[str], prefer_single: str = "2.4"):
+    """Decide which adapter carries which band. Returns (radios, notes).
+
+    One adapter beacons on one channel, so the band split IS the radio split.
+    With two, the goal is coverage: 2.4 GHz so that nothing is excluded, 5 GHz so
+    that the whole class is not sharing one 20 MHz channel. With one, inclusion
+    wins -- every device ever built can see 2.4 GHz, and a student whose laptop
+    cannot find the network cannot sit the exam.
+    """
+    caps = {i: usable_channels(i) for i in ifaces}
+    free = [i for i in ifaces if caps.get(i)]
+    radios: list[dict] = []
+    notes: list[str] = []
+
+    def assign(iface: str, band: str, prefer: list[int]) -> None:
+        radios.append({"interface": iface,
+                       "channel": _pick_channel(caps[iface][band], prefer),
+                       "channel_width_mhz": 20 if band == "2.4" else 80})
+
+    def first_with(band: str, pool: list[str]) -> str | None:
+        return next((i for i in pool if band in caps.get(i, {})), None)
+
+    if not free:
+        return radios, ["no adapter here reports a usable channel. Check `rfkill "
+                        "list` and the regulatory domain (`iw reg get`)."]
+
+    if len(free) >= 2:
+        a = first_with("2.4", free)
+        b = first_with("5", [i for i in free if i != a]) if a else None
+        if a and b:
+            assign(a, "2.4", [6, 1, 11])
+            assign(b, "5", [36, 149, 44])
+            notes.append(f"dual-band: {a} carries 2.4 GHz so every device can see the "
+                         f"network, {b} carries 5 GHz for speed. Both beacon the SAME "
+                         f"ssid and are bridged, so a student sees one network and "
+                         f"their device picks the band.")
+        else:
+            band = "5" if first_with("5", free) else "2.4"
+            pair = [i for i in free if band in caps[i]][:2]
+            prefs = ([36], [149]) if band == "5" else ([1], [11])
+            for iface, pref in zip(pair, prefs):
+                assign(iface, band, pref)
+            notes.append(f"every adapter here can only do {band} GHz, so both radios "
+                         f"are on it, on non-overlapping channels. That is extra "
+                         f"capacity, NOT extra compatibility: a device that cannot do "
+                         f"{band} GHz still will not see the exam network.")
+    else:
+        iface = free[0]
+        band = prefer_single if prefer_single in caps[iface] else next(iter(caps[iface]))
+        assign(iface, band, [6, 1, 11] if band == "2.4" else [36, 149])
+        if band == "2.4":
+            notes.append("one adapter, so one band. 2.4 GHz, because every device can "
+                         "see it. A second adapter is what buys you both bands -- "
+                         "there is no way to get them from one radio.")
+        else:
+            notes.append("one adapter, on 5 GHz. Faster and quieter, but a 2.4-only "
+                         "device will not see the exam network at all. Add a second "
+                         "adapter for both bands.")
+    return radios, notes
+
+
+def cmd_autoconfigure(pol: dict) -> int:
+    """Detect the hardware and write a policy that matches it.
+
+    The point is that exam morning should not require remembering which adapter
+    is which, what a DFS channel is, or that a fresh Kali boots with a regulatory
+    domain under which no 5 GHz AP can legally beacon.
+    """
+    args = sys.argv[2:]
+    prefer = "5" if "--prefer-5ghz" in args else "2.4"
+    keep = "--keep-passphrase" in args
+    do_system = os.geteuid() == 0 and "--no-system" not in args
+
+    radios_all = wireless_interfaces()
+    usable = [i for i in radios_all if supports_ap(i) is not False]
+    print(f"themis-ap autoconfigure\n")
+    if not radios_all:
+        print("no wireless interfaces found. Pass the adapter(s) through to this VM,")
+        print("then check `ip link`.")
+        return 1
+    for i in radios_all:
+        drv = iface_driver(i) or "?"
+        bands = usable_channels(i)
+        shown = ", ".join(f"{b} GHz ({len(c)} usable ch)" for b, c in sorted(bands.items()))
+        mark = "" if i in usable else "   <- no AP mode, skipped"
+        print(f"  found {i:<8} driver {drv:<10} {shown or 'no usable channel'}{mark}")
+    print()
+
+    # The regulatory domain gates which channels are usable AT ALL, so fix it
+    # before planning rather than planning around a temporary restriction.
+    want_cc = str(pol.get("country_code", "US")).upper()
+    if do_system and regdomain() == "00":
+        print(f"  regulatory domain was '00' (world): no 5 GHz AP channel is legal")
+        print(f"  under it. Setting {want_cc} ...")
+        run(["iw", "reg", "set", want_cc], check=False)
+        time.sleep(1)
+        reg_file = Path("/etc/modprobe.d/themis-regdom.conf")
+        try:
+            reg_file.write_text(f"# Themis: a world regulatory domain forbids every 5 GHz\n"
+                                f"# AP channel, and that is the default on a fresh boot.\n"
+                                f"options cfg80211 ieee80211_regdom={want_cc}\n")
+            print(f"  wrote {reg_file} so it survives a reboot")
+        except OSError as e:
+            print(f"  could not persist the regulatory domain: {e}", file=sys.stderr)
+        print()
+
+    radios, notes = plan_radios(usable, prefer_single=prefer)
+    if not radios:
+        for n in notes:
+            print(f"  {n}")
+        return 1
+
+    pol["radios"] = radios
+    pol["bridge"] = pol.get("bridge", DEFAULT_BRIDGE)
+    pol["ap_interface"] = radios[0]["interface"]      # single-radio fallback
+    pol["channel"] = radios[0]["channel"]
+    pol["channel_width_mhz"] = radios[0]["channel_width_mhz"]
+    if not keep or pol.get("passphrase") == "CHANGE-ME-EVERY-EXAM":
+        pol["passphrase"] = secrets.token_urlsafe(12)
+    POLICY.write_text(json.dumps(pol, indent=2) + "\n")
+
+    for r in radios:
+        print(f"  {r['interface']:<8} {band_of(r['channel'])} GHz  channel "
+              f"{r['channel']:<4} {effective_width(r['channel'], r['channel_width_mhz'])} MHz")
+    print()
+    for n in notes:
+        print(f"  note: {n}\n")
+
+    if do_system:
+        for r in radios:
+            if nm_manages(r["interface"]):
+                print(f"  taking {r['interface']} away from NetworkManager, which would "
+                      f"otherwise tear the AP down under hostapd")
+                run(["nmcli", "device", "set", r["interface"], "managed", "no"], check=False)
+        if not bt_blacklisted():
+            src = TEMPLATES / "blacklist-themis-bt.conf"
+            try:
+                (Path("/etc/modprobe.d") / src.name).write_text(src.read_text())
+                print(f"  blacklisted btusb (the MT7921AU Bluetooth function crashes its "
+                      f"own Wi-Fi side on kernel 6.6+)")
+                run(["systemctl", "disable", "--now", "bluetooth"], check=False)
+                run(["modprobe", "-r", "btusb", "btmtk"], check=False)
+            except OSError as e:
+                print(f"  could not blacklist btusb: {e}", file=sys.stderr)
+        print()
+    elif os.geteuid() != 0:
+        print("  not root, so nothing on the system was changed. Re-run with sudo to")
+        print("  also fix the regulatory domain, hand the radios over from")
+        print("  NetworkManager, and close the Bluetooth crash trap.\n")
+
+    print(f"  ssid        {pol['ssid']}")
+    print(f"  passphrase  {pol['passphrase']}")
+    print(f"  mode        {mode_of(pol)}")
+    print()
+    print("  Next:  sudo netguard/linux/bin/themis-ap preflight")
+    return 0
+
+
+def cmd_set_mode(pol: dict) -> int:
+    """Switch between air-gapped, allowlist and blocklist."""
+    args = [a for a in sys.argv[2:] if not a.startswith("-")]
+    if not args or args[0] not in MODES:
+        print("usage: themis-ap set-mode <airgap|allowlist|blocklist>\n")
+        for key, m in MODES.items():
+            print(f"  {key:<11} {m['label']}")
+            print(f"              {m['blurb']}\n")
+        return 1
+    key = args[0]
+    m = MODES[key]
+    pol["profile"] = m["profile"]
+    if m["proxy_mode"]:
+        pol["proxy_mode"] = m["proxy_mode"]
+    else:
+        pol.pop("proxy_mode", None)
+    pol.setdefault("allow_dns_names", [])
+    pol.setdefault("block_dns_names", [])
+    POLICY.write_text(json.dumps(pol, indent=2) + "\n")
+    print(f"mode is now {key} ({m['label']})\n  {m['blurb']}")
+    if key == "allowlist" and not pol["allow_dns_names"]:
+        print("\n  The allowlist is EMPTY, so nothing will be reachable. Add the exam")
+        print("  site with:  themis-ap set-list allow <file>")
+    if key == "blocklist" and not pol["block_dns_names"]:
+        print("\n  The blocklist is empty, so the whole web is reachable.")
+    return 0
+
+
+def cmd_set_list(pol: dict) -> int:
+    """Replace the allow or block list from a file, one name per line."""
+    args = [a for a in sys.argv[2:] if not a.startswith("-")]
+    if len(args) < 2 or args[0] not in ("allow", "block"):
+        print("usage: themis-ap set-list <allow|block> <file>")
+        print("       one hostname per line; blank lines and # comments ignored.")
+        print("       A pasted URL is reduced to its hostname.")
+        return 1
+    which, src = args[0], Path(args[1])
+    try:
+        raw = src.read_text(errors="replace").splitlines()
+    except OSError as e:
+        die(f"cannot read {src}: {e}")
+    names, bad = clean_hostnames(raw)
+    key = "allow_dns_names" if which == "allow" else "block_dns_names"
+    pol[key] = names
+    POLICY.write_text(json.dumps(pol, indent=2) + "\n")
+    print(f"{key}: {len(names)} name(s)")
+    for n in names:
+        print(f"  {n}")
+    if bad:
+        print(f"\n  REJECTED {len(bad)} entr{'y' if len(bad) == 1 else 'ies'} that are "
+              f"not hostnames:", file=sys.stderr)
+        for b in bad:
+            print(f"    {b}", file=sys.stderr)
+    return 0
 
 
 def cmd_configure(pol: dict) -> int:
@@ -467,7 +1203,11 @@ def cmd_preflight(pol: dict) -> int:
 
 
 def _collect(pol: dict):
-    ap_if, prof = pol["ap_interface"], pol["profile"]
+    prof = pol["profile"]
+    radios = radios_of(pol)
+    multi = len(radios) > 1
+    bridge = bridge_of(pol)
+    ap_if = student_iface(pol)
     fails, warns, oks = [], [], []
 
     if os.geteuid() != 0:
@@ -491,7 +1231,8 @@ def _collect(pol: dict):
     # THE trap: MT7921AU's Bluetooth function crashes its Wi-Fi side on 6.6+.
     bt = sorted(loaded_modules() & set(BT_MODULES))
     blacklisted = bt_blacklisted()
-    adapter_present = Path(f"/sys/class/net/{ap_if}").exists()
+    adapter_present = any(Path(f"/sys/class/net/{r['interface']}").exists()
+                          for r in radios)
     bt_fix = (f"        sudo cp {TEMPLATES / 'blacklist-themis-bt.conf'} /etc/modprobe.d/\n"
               f"        sudo systemctl disable --now bluetooth\n"
               f"        sudo modprobe -r btusb btmtk   (or reboot)")
@@ -521,31 +1262,50 @@ def _collect(pol: dict):
             "blacklisted -- nothing stops it loading on the next boot or replug:\n" + bt_fix
         )
 
-    if not Path(f"/sys/class/net/{ap_if}").exists():
-        fails.append(f"ap_interface {ap_if!r} does not exist. Plug the adapter in and check `ip link`.")
-    else:
-        drv = iface_driver(ap_if)
+    names = [r["interface"] for r in radios]
+    if len(set(names)) != len(names):
+        fails.append(f"the same interface appears twice in radios: {names}. One radio "
+                     f"cannot beacon on two channels -- that is what the second "
+                     f"adapter is for.")
+    if multi:
+        bands = {band_of(r["channel"]) for r in radios}
+        if len(bands) == 1:
+            warns.append(f"both radios are on {bands.pop()} GHz. That works, but it is "
+                         f"not dual-band -- a device that cannot see that band still "
+                         f"cannot see the exam network. Put one radio on 2.4 and the "
+                         f"other on 5.")
+        else:
+            oks.append(f"dual-band: {', '.join(sorted(bands))} GHz both beaconing one SSID")
+
+    for r in radios:
+        rif, rch = r["interface"], r["channel"]
+        tag = f"{rif} ({band_of(rch)} GHz ch {rch})" if multi else rif
+        if not Path(f"/sys/class/net/{rif}").exists():
+            fails.append(f"radio interface {rif!r} does not exist. Plug the adapter in "
+                         f"and check `ip link`.")
+            continue
+        drv = iface_driver(rif)
         if drv == "mt7921u":
-            oks.append(f"{ap_if} is driven by the in-tree mt7921u driver")
+            oks.append(f"{tag} is driven by the in-tree mt7921u driver")
         elif drv:
-            warns.append(f"{ap_if} uses driver {drv!r}, not mt7921u. If this is the "
+            warns.append(f"{rif} uses driver {drv!r}, not mt7921u. If this is the "
                          f"AWUS1900 (rtl8814au), it needs an out-of-tree DKMS module that "
                          f"breaks on kernel updates -- prefer the AWUS036AXML.")
-        ap = supports_ap(ap_if)
+        ap = supports_ap(rif)
         if ap is False:
-            fails.append(f"`iw list` does not report AP in supported interface modes for {ap_if}")
+            fails.append(f"`iw list` does not report AP in supported interface modes for {rif}")
         elif ap is None:
-            warns.append(f"could not confirm AP mode support for {ap_if} from `iw list`")
+            warns.append(f"could not confirm AP mode support for {rif} from `iw list`")
         else:
-            oks.append("the radio reports AP mode support")
+            oks.append(f"{tag} reports AP mode support")
 
-        if nm_manages(ap_if):
+        if nm_manages(rif):
             fails.append(
-                f"NetworkManager is managing {ap_if} and will tear down the AP under "
-                f"hostapd. Fix:  sudo nmcli device set {ap_if} managed no"
+                f"NetworkManager is managing {rif} and will tear down the AP under "
+                f"hostapd. Fix:  sudo nmcli device set {rif} managed no"
             )
         else:
-            oks.append(f"NetworkManager is not managing {ap_if}")
+            oks.append(f"NetworkManager is not managing {rif}")
 
     rf = rfkill_blocked(ap_if)
     if rf is True:
@@ -566,12 +1326,82 @@ def _collect(pol: dict):
                   "host whose firewall matters."
             )
 
-    ch = int(pol["channel"])
-    if ch not in NON_DFS_5GHZ:
-        fails.append(f"channel {ch} is DFS or invalid. mt7921u cannot run an AP on a DFS "
-                     f"channel -- use one of {sorted(NON_DFS_5GHZ)}.")
+    # Host-level: the kernel enforces ONE regulatory domain for every radio, so
+    # this is asked once. A channel can be perfectly legal in the configured
+    # country and still be forbidden to this host, because on a fresh Kali install
+    # -- and after every reboot -- the domain is '00', under which the entire
+    # 5 GHz band is passive-scan: hostapd may listen but not beacon. It then fails
+    # with a bare nl80211 error, in the room, with students waiting.
+    want = str(pol.get("country_code", "")).upper()
+    reg = regdomain()
+    if reg == "00":
+        fails.append(
+            "the regulatory domain is '00' (world), under which EVERY 5 GHz channel is "
+            "passive-scan only -- hostapd cannot legally beacon on any of them, and TX "
+            "power is capped near 3 dBm, which would not cover a classroom even if it "
+            "could.  hostapd's own country_code= does not fix this; the kernel is "
+            "already committed by the time hostapd asks.\n"
+            f"        Fix now:        sudo iw reg set {want or 'US'}\n"
+            "        Fix permanently (otherwise the next reboot silently takes the\n"
+            "        5 GHz band away again, and preflight is the only thing that\n"
+            "        would have told you):\n"
+            f"        echo options cfg80211 ieee80211_regdom={want or 'US'} | "
+            "sudo tee /etc/modprobe.d/themis-regdom.conf"
+        )
+    elif reg and want and reg != want:
+        warns.append(f"the kernel is enforcing regulatory domain {reg!r} but policy.json "
+                     f"asks for country_code {want!r}. The kernel wins, so channel and "
+                     f"power limits are {reg!r}'s.  (sudo iw reg set {want})")
+    elif reg:
+        oks.append(f"the kernel is enforcing regulatory domain {reg!r}")
     else:
-        oks.append(f"channel {ch} is non-DFS")
+        warns.append("could not read the regulatory domain from `iw reg get`, so a "
+                     "channel this host is barred from beaconing on cannot be ruled out")
+
+    for r in radios:
+        rif, rch, rw = r["interface"], r["channel"], r["channel_width_mhz"]
+        tag = f"{rif} ch {rch}" if multi else f"channel {rch}"
+        if band_of(rch) == "2.4":
+            if rch not in USABLE_24GHZ:
+                fails.append(f"channel {rch} is not usable on 2.4 GHz in the US -- "
+                             f"use 1, 6 or 11.")
+            elif rch not in CLEAN_24GHZ:
+                warns.append(f"{tag} overlaps its neighbours. Only 1, 6 and 11 do not, "
+                             f"and in a university building that overlap is other "
+                             f"people's traffic competing with your exam.")
+            else:
+                oks.append(f"{tag} is a non-overlapping 2.4 GHz channel")
+        elif rch not in NON_DFS_5GHZ:
+            fails.append(f"channel {rch} is DFS or invalid. mt7921u cannot run an AP on "
+                         f"a DFS channel -- use one of {sorted(NON_DFS_5GHZ)}.")
+        else:
+            oks.append(f"{tag} is non-DFS")
+
+        eff = effective_width(rch, rw)
+        if eff != rw:
+            warns.append(f"{rif}: {rw} MHz is not available on channel {rch}, so it will "
+                         f"run at {eff} MHz. Handing hostapd the wider figure would just "
+                         f"make it refuse the channel.")
+
+        no_ir = channel_no_ir(rif, rch)
+        if no_ir is True:
+            fails.append(
+                f"channel {rch} is marked 'no IR' for {rif}: the kernel permits "
+                f"listening on it but not initiating a transmission, which is what a "
+                f"beacon is. hostapd will not come up on it.\n"
+                f"        Fix the regulatory domain first (sudo iw reg set "
+                f"{want or 'US'}), then re-run preflight."
+            )
+        elif no_ir is False:
+            oks.append(f"{tag} is clear to beacon on (not 'no IR')")
+
+        pwr = channel_power_dbm(rif, rch)
+        if pwr is not None and pwr < 15:
+            warns.append(f"the regulatory ceiling on {tag} is only {pwr:.0f} dBm. That "
+                         f"is a cap, not a setting -- no hostapd option raises it -- and "
+                         f"it will not reach the back of a classroom.")
+        elif pwr is not None:
+            oks.append(f"{tag} permits {pwr:.0f} dBm, enough to cover a room")
 
     if pol.get("passphrase") == "CHANGE-ME-EVERY-EXAM" and not (pol.get("enterprise") or {}).get("enabled"):
         fails.append("passphrase is still the placeholder -- set a fresh one for this exam")
@@ -588,6 +1418,47 @@ def _collect(pol: dict):
         oks.append("ip forwarding is off -- no egress path exists for a VPN or Tor client")
     if prof == "allowlist" and fwd != "1":
         fails.append("profile 'allowlist' needs: sudo sysctl -w net.ipv4.ip_forward=1")
+
+    if prof == "proxy":
+        if fwd == "1":
+            fails.append(
+                "ip_forward=1, but in this mode nothing should be routed at all.\n"
+                "        The guarantee here is an absence: students reach two local\n"
+                "        sockets and the proxy is the only thing that egresses, which\n"
+                "        is precisely why a self-hosted VPN on any port and any address\n"
+                "        has nothing to reach. With forwarding on, that is false.\n"
+                "        Fix: sudo sysctl -w net.ipv4.ip_forward=0")
+        else:
+            oks.append("ip forwarding is off, so no student packet is ever routed -- "
+                       "the proxy is the only path off this network")
+        allow = [n for n in (pol.get("allow_dns_names") or []) if not str(n).startswith("_")]
+        block = [n for n in (pol.get("block_dns_names") or []) if not str(n).startswith("_")]
+        if pol.get("proxy_mode") == "block":
+            oks.append(f"blocklist mode: {len(block)} name(s) refused, everything else "
+                       f"reachable over HTTPS")
+            if not block:
+                warns.append("the blocklist is empty, so the entire web is reachable. "
+                             "That may be what an open-book exam wants, but it is worth "
+                             "saying out loud.")
+            warns.append("a blocklist is the weak direction: a site you did not think "
+                         "of is a site that works, and that includes any pastebin, any "
+                         "chat, and every AI front-end that launches between now and "
+                         "the exam. Allowlist mode is the one that can be reasoned about.")
+        else:
+            if not allow:
+                fails.append("allowlist mode with an EMPTY allowlist refuses everything, "
+                             "including the exam site. Either add the exam site or use "
+                             "mode 'airgap', which makes the same guarantee without a "
+                             "process that has to stay running.")
+            else:
+                oks.append(f"allowlist mode: only {', '.join(allow)} is reachable, and "
+                           f"it is matched by NAME -- so it survives the CDN rotating "
+                           f"and cannot be reached by aiming at an allowed address with "
+                           f"a different SNI")
+        if not pol.get("uplink_interface"):
+            warns.append("no uplink_interface is set. The proxy egresses over whatever "
+                         "the host's default route is, which is usually right -- but it "
+                         "means preflight cannot tell you the uplink is down.")
 
     if prof == "allowlist":
         names = pol.get("allow_dns_names") or []
@@ -640,6 +1511,81 @@ def cmd_render(pol: dict) -> int:
     return 0
 
 
+def _kill_all_pidfiles(verbose: bool = False) -> None:
+    """Stop everything we started.
+
+    Globbed rather than listed, because with two radios there is one hostapd per
+    radio and a half-written list is how a stray hostapd survives `down` still
+    holding a radio -- which then makes the next `up` fail for a reason that
+    looks nothing like the cause. Control clients die first so they do not race
+    to reconnect to a socket that is going away.
+    """
+    if not RUN_DIR.is_dir():
+        return
+    order, seen = [], set()
+    for pat in ("hostapd_cli*.pid", "hostapd-*.pid", "hostapd.pid", "dnsmasq.pid",
+                "proxy.pid"):
+        for pf in sorted(RUN_DIR.glob(pat)):
+            if pf not in seen:
+                seen.add(pf)
+                order.append(pf)
+    for pf in order:
+        try:
+            os.kill(int(pf.read_text().strip()), 15)
+            if verbose:
+                print(f"stopped {pf.stem}")
+        except (ProcessLookupError, ValueError, OSError):
+            if verbose:
+                print(f"{pf.stem} was not running")
+        pf.unlink(missing_ok=True)
+
+
+def _release_interfaces(ifaces, bridge: str | None) -> None:
+    """Hand every radio back and remove the bridge we made.
+
+    A bridge left behind keeps 10.83.0.1 on the host, so the next `up` cannot
+    assign it and reports an address clash with itself.
+    """
+    for iface in ifaces:
+        run(["ip", "link", "set", iface, "nomaster"], check=False)
+        run(["ip", "addr", "flush", "dev", iface], check=False)
+        run(["ip", "link", "set", iface, "down"], check=False)
+    if bridge:
+        run(["ip", "addr", "flush", "dev", bridge], check=False)
+        run(["ip", "link", "set", bridge, "down"], check=False)
+        run(["ip", "link", "del", bridge], check=False)
+
+
+def _wait_for_beacon(iface: str, hp, logp: Path, label: str) -> str | None:
+    """Block until this radio is genuinely beaconing. Error string, or None.
+
+    Announcing "exam AP is up" because a process was spawned is how an operator
+    comes to believe the exam network exists while students see nothing at all.
+    """
+    ctrl = Path("/var/run/hostapd") / iface
+    for _ in range(40):                      # up to 10s
+        if hp.poll() is not None:
+            return (f"hostapd for {label} exited immediately (status {hp.returncode}):"
+                    f"\n{logp.read_text(errors='replace')[-700:]}")
+        if ctrl.exists():
+            break
+        time.sleep(0.25)
+    else:
+        return (f"hostapd for {label} is running but never claimed the radio (no "
+                f"control socket at {ctrl} after 10s):"
+                f"\n{logp.read_text(errors='replace')[-700:]}")
+    for _ in range(20):                      # up to 5s more
+        if "AP-ENABLED" in logp.read_text(errors="replace")[-4000:]:
+            return None
+        if hp.poll() is not None:
+            return (f"hostapd for {label} died while enabling the AP:"
+                    f"\n{logp.read_text(errors='replace')[-700:]}")
+        time.sleep(0.25)
+    print(f"  note: {label} has the radio but has not logged AP-ENABLED yet.",
+          file=sys.stderr)
+    return None
+
+
 def cmd_up(pol: dict) -> int:
     if os.geteuid() != 0:
         die("`up` must run as root: sudo netguard/linux/bin/themis-ap up")
@@ -655,7 +1601,9 @@ def cmd_up(pol: dict) -> int:
     if run(["nft", "-c", "-f", str(paths["nftables.conf"])], check=False).returncode != 0:
         die("rendered nftables ruleset is invalid -- refusing to load it")
 
-    ap_if, srv = pol["ap_interface"], pol["server_ip"]
+    radios = radios_of(pol)
+    bridge = bridge_of(pol)
+    ap_if, srv = student_iface(pol), pol["server_ip"]
     bits = pol.get("netmask_bits", 24)
 
     # The generated ruleset begins with `flush ruleset`, which removes EVERY
@@ -673,6 +1621,8 @@ def cmd_up(pol: dict) -> int:
         print("could not read the existing nftables ruleset; `down` will simply flush")
 
     STATE.write_text(json.dumps({"ap_interface": ap_if, "profile": pol["profile"],
+                                 "radios": [r["interface"] for r in radios],
+                                 "bridge": bridge,
                                  "started": time.time(),
                                  "saved_ruleset": str(saved)}, indent=2))
 
@@ -684,23 +1634,33 @@ def cmd_up(pol: dict) -> int:
         at, with students waiting.
         """
         print(f"\n{why}\nrolling back ...", file=sys.stderr)
-        for name in ("hostapd_cli.pid", "hostapd.pid", "dnsmasq.pid"):
-            pf = RUN_DIR / name
-            if pf.exists():
-                try:
-                    os.kill(int(pf.read_text().strip()), 15)
-                except (ProcessLookupError, ValueError, OSError):
-                    pass
-                pf.unlink(missing_ok=True)
+        _kill_all_pidfiles()
         run(["nft", "flush", "ruleset"], check=False)
         if saved.exists() and saved.read_text().strip():
             run(["nft", "-f", str(saved)], check=False)
             print("  restored the previous nftables ruleset", file=sys.stderr)
+        _release_interfaces([r["interface"] for r in radios], bridge)
         run(["ip", "addr", "flush", "dev", ap_if], check=False)
         run(["ip", "link", "set", ap_if, "down"], check=False)
         STATE.unlink(missing_ok=True)
         print("  host is back as it was. Nothing is broadcasting.", file=sys.stderr)
         return 1
+
+    if bridge:
+        bands = ", ".join(f"{r['interface']} on {band_of(r['channel'])} GHz "
+                          f"(ch {r['channel']})" for r in radios)
+        print(f"\nbuilding {bridge} so both bands are ONE network: {bands}")
+        run(["ip", "link", "del", bridge], check=False)       # idempotent
+        if run(["ip", "link", "add", "name", bridge, "type", "bridge"],
+               check=False).returncode != 0:
+            return rollback(f"could not create bridge {bridge}")
+        # hostapd enslaves each radio itself once bridge= is set, but it can only
+        # do that to a radio that is already up.
+        for r in radios:
+            run(["ip", "addr", "flush", "dev", r["interface"]], check=False)
+            if run(["ip", "link", "set", r["interface"], "up"],
+                   check=False).returncode != 0:
+                return rollback(f"could not bring {r['interface']} up")
 
     print(f"\nconfiguring {ap_if} as {srv}/{bits} ...")
     run(["ip", "addr", "flush", "dev", ap_if], check=False)
@@ -720,49 +1680,86 @@ def cmd_up(pol: dict) -> int:
         return rollback("dnsmasq would not start -- students would associate and get "
                         f"no address:\n  {(r.stderr or r.stdout or '').strip()[:300]}")
 
-    print("starting hostapd ...")
-    log = (RUN_DIR / "hostapd.log").open("a")
-    hp = subprocess.Popen(["hostapd", str(paths["hostapd.conf"])], stdout=log, stderr=log)
-    (RUN_DIR / "hostapd.pid").write_text(str(hp.pid))
+    multi = len(radios) > 1
+    print(f"starting hostapd on {len(radios)} radio(s) ...")
+    procs = []
+    for r in radios:
+        iface = r["interface"]
+        conf = paths["hostapd.conf" if not multi else f"hostapd-{iface}.conf"]
+        logp = RUN_DIR / ("hostapd.log" if not multi else f"hostapd-{iface}.log")
+        hp = subprocess.Popen(["hostapd", str(conf)],
+                              stdout=logp.open("a"), stderr=subprocess.STDOUT)
+        (RUN_DIR / ("hostapd.pid" if not multi else f"hostapd-{iface}.pid")
+         ).write_text(str(hp.pid))
+        procs.append((r, hp, logp))
 
-    # Wait for hostapd to actually CLAIM the radio, and notice if it dies trying.
-    # Printing "exam AP is up" because a process was spawned is how an operator ends
-    # up believing the exam network exists while students see nothing at all.
-    ctrl = Path("/var/run/hostapd") / ap_if
-    enabled = False
-    for _ in range(40):                      # up to 10s
-        if hp.poll() is not None:
-            tail = (RUN_DIR / "hostapd.log").read_text(errors="replace")[-700:]
-            return rollback(f"hostapd exited immediately (status {hp.returncode}):\n{tail}")
-        if ctrl.exists():
-            enabled = True
-            break
-        time.sleep(0.25)
-    if not enabled:
-        tail = (RUN_DIR / "hostapd.log").read_text(errors="replace")[-700:]
-        return rollback("hostapd is running but never claimed the radio "
-                        f"(no control socket at {ctrl} after 10s):\n{tail}")
+    for r, hp, logp in procs:
+        label = f"{r['interface']} ({band_of(r['channel'])} GHz, ch {r['channel']})"
+        err = _wait_for_beacon(r["interface"], hp, logp, label)
+        if err:
+            return rollback(err)
+        print(f"  beaconing on {label}")
 
-    # The control socket exists, but AP-ENABLED is what says the beacon is out.
-    beaconing = False
-    for _ in range(20):                      # up to 5s more
-        if "AP-ENABLED" in (RUN_DIR / "hostapd.log").read_text(errors="replace")[-4000:]:
-            beaconing = True
-            break
-        if hp.poll() is not None:
-            tail = (RUN_DIR / "hostapd.log").read_text(errors="replace")[-700:]
-            return rollback(f"hostapd died while enabling the AP:\n{tail}")
-        time.sleep(0.25)
-    if not beaconing:
-        print("  note: hostapd has the radio but has not logged AP-ENABLED yet.",
-              file=sys.stderr)
+    if pol["profile"] == "proxy":
+        # The firewall sends every student HTTPS connection to this port. If
+        # nothing is listening on it, every page in the exam hangs rather than
+        # failing -- so this is started here, as part of bringing the network up,
+        # and `up` does not return success without it.
+        pxp = int(pol.get("proxy_port", 443))
+        print(f"starting the name-validating proxy on {srv}:{pxp} ...")
+        plog = RUN_DIR / "proxy.log"
+        # PYTHONUNBUFFERED, because a child's print() goes to a pipe rather than a
+        # terminal and Python then buffers it. The proxy's startup banner and its
+        # reload confirmations sat in that buffer unflushed, so proxy.log read as
+        # empty at precisely the moment it was being consulted.
+        env = dict(os.environ, PYTHONUNBUFFERED="1")
+        px = subprocess.Popen(
+            [sys.executable, "-m", "themis.proxy",
+             "--policy", str(POLICY), "--bind", srv, "--port", str(pxp),
+             "--journal", str(JOURNAL), "--log", str(RUN_DIR / "proxy-decisions.log")],
+            cwd=str(ROOT.parent.parent), stdout=plog.open("a"),
+            stderr=subprocess.STDOUT, env=env)
+        (RUN_DIR / "proxy.pid").write_text(str(px.pid))
+        listening = False
+        for _ in range(40):                        # up to 10s
+            if px.poll() is not None:
+                tail = plog.read_text(errors="replace")[-700:]
+                return rollback(f"the proxy exited immediately (status "
+                                f"{px.returncode}):\n{tail}")
+            probe = socket.socket()
+            probe.settimeout(0.3)
+            try:
+                probe.connect((srv, pxp))
+                listening = True
+            except OSError:
+                pass
+            finally:
+                probe.close()
+            if listening:
+                break
+            time.sleep(0.25)
+        if not listening:
+            tail = plog.read_text(errors="replace")[-700:]
+            return rollback(f"the proxy is running but is not accepting connections "
+                            f"on {srv}:{pxp}:\n{tail}")
+        mode = "blocklist" if pol.get("proxy_mode") == "block" else "allowlist"
+        print(f"  proxy is up in {mode} mode")
 
     hook = ROOT / "bin" / "themis-sta-hook"
     if hook.exists():
-        print("attaching association/disassociation hook ...")
-        ch = subprocess.Popen(["hostapd_cli", "-i", ap_if, "-a", str(hook)],
-                              stdout=log, stderr=log)
-        (RUN_DIR / "hostapd_cli.pid").write_text(str(ch.pid))
+        # One control client PER RADIO. hostapd_cli attaches to a single
+        # interface's socket, so with two radios a lone client would record
+        # associations from one band and silently miss the other -- and a student
+        # the console never saw associate reads as a student who never arrived.
+        print(f"attaching association hook to {len(radios)} radio(s) ...")
+        for r in radios:
+            iface = r["interface"]
+            clog = (RUN_DIR / (f"hostapd_cli-{iface}.log" if multi
+                               else "hostapd_cli.log")).open("a")
+            ch = subprocess.Popen(["hostapd_cli", "-i", iface, "-a", str(hook)],
+                                  stdout=clog, stderr=subprocess.STDOUT)
+            (RUN_DIR / (f"hostapd_cli-{iface}.pid" if multi
+                        else "hostapd_cli.pid")).write_text(str(ch.pid))
 
     print("\nexam AP is up.\n")
     return cmd_status(pol)
@@ -771,23 +1768,22 @@ def cmd_up(pol: dict) -> int:
 def cmd_down(pol: dict) -> int:
     if os.geteuid() != 0:
         die("`down` must run as root: sudo netguard/linux/bin/themis-ap down")
-    ap_if = pol["ap_interface"]
+    ap_if = student_iface(pol)
+    ifaces = [r["interface"] for r in radios_of(pol)]
+    bridge = bridge_of(pol)
+    # Prefer what we actually brought up over what the policy says now: the policy
+    # may have been edited since, and tearing down the wrong interface leaves a
+    # radio beaconing an exam network nobody is watching.
     if STATE.exists():
         try:
-            ap_if = json.loads(STATE.read_text()).get("ap_interface", ap_if)
+            st = json.loads(STATE.read_text())
+            ap_if = st.get("ap_interface", ap_if)
+            ifaces = st.get("radios", ifaces)
+            bridge = st.get("bridge", bridge)
         except json.JSONDecodeError:
             pass
 
-    for name in ("hostapd_cli.pid", "hostapd.pid", "dnsmasq.pid"):
-        pf = RUN_DIR / name
-        if not pf.exists():
-            continue
-        try:
-            os.kill(int(pf.read_text().strip()), 15)
-            print(f"stopped {name[:-4]}")
-        except (ProcessLookupError, ValueError):
-            print(f"{name[:-4]} was not running")
-        pf.unlink(missing_ok=True)
+    _kill_all_pidfiles(verbose=True)
 
     run(["nft", "flush", "ruleset"], check=False)
     saved = RUN_DIR / "nftables.saved"
@@ -801,30 +1797,52 @@ def cmd_down(pol: dict) -> int:
                   f"         nft said: {(r.stderr or '').strip()[:200]}", file=sys.stderr)
     else:
         print("flushed nftables (there was nothing to restore)")
+    _release_interfaces(ifaces, bridge)
     run(["ip", "addr", "flush", "dev", ap_if], check=False)
     run(["ip", "link", "set", ap_if, "down"], check=False)
-    print(f"released {ap_if}")
+    print(f"released {', '.join(ifaces)}" + (f" and removed {bridge}" if bridge else ""))
     STATE.unlink(missing_ok=True)
     print("\nexam AP is down.")
     return 0
 
 
 def cmd_status(pol: dict) -> int:
-    prof, ap_if = pol["profile"], pol["ap_interface"]
-    hostapd_up = (RUN_DIR / "hostapd.pid").exists()
+    prof = pol["profile"]
+    radios = radios_of(pol)
+    multi = len(radios) > 1
+    bridge = bridge_of(pol)
     dns_up = (RUN_DIR / "dnsmasq.pid").exists()
 
-    stations = []
-    if hostapd_up and shutil.which("hostapd_cli"):
-        for line in out(["hostapd_cli", "-i", ap_if, "list_sta"]).splitlines():
-            if re.match(r"^[0-9a-f:]{17}$", line.strip()):
-                stations.append(line.strip())
+    # Per radio, because "12 associated" tells an operator nothing about whether
+    # the 2.4 GHz side ever came up. If one band is dead, the number that proves
+    # it is that band's own station count.
+    per_radio, stations = [], []
+    for r in radios:
+        iface = r["interface"]
+        pidf = RUN_DIR / (f"hostapd-{iface}.pid" if multi else "hostapd.pid")
+        running = pidf.exists()
+        found = []
+        if running and shutil.which("hostapd_cli"):
+            for line in out(["hostapd_cli", "-i", iface, "list_sta"]).splitlines():
+                if re.match(r"^[0-9a-f:]{17}$", line.strip().lower()):
+                    found.append(line.strip())
+        per_radio.append((r, running, found))
+        stations.extend(found)
+    hostapd_up = any(running for _, running, _ in per_radio)
 
     print(f"profile          {prof}")
-    print(f"ssid             {pol['ssid']}  (channel {pol['channel']}, {pol.get('channel_width_mhz', 80)} MHz)")
-    print(f"hostapd          {'running' if hostapd_up else 'not running'}")
+    print(f"ssid             {pol['ssid']}")
+    for r, running, found in per_radio:
+        w = effective_width(r["channel"], r["channel_width_mhz"])
+        print(f"  {r['interface']:<12} {band_of(r['channel'])} GHz  ch {r['channel']:<4} "
+              f"{w} MHz   {'beaconing' if running else 'NOT RUNNING'}   "
+              f"{len(found)} station(s)")
+    if bridge:
+        print(f"bridge           {bridge}  (both bands are one network)")
     print(f"dnsmasq          {'running' if dns_up else 'not running'}")
-    print(f"client isolation {'ON' if pol.get('client_isolation', True) else 'OFF'}")
+    iso = pol.get("client_isolation", True)
+    print(f"client isolation {'ON' if iso else 'OFF'}" +
+          ("  (+ bridge-level, so it holds across bands too)" if iso and bridge else ""))
     print(f"identity         {'WPA2-Enterprise (per-student credential)' if (pol.get('enterprise') or {}).get('enabled') else 'WPA2-PSK + captive portal (student asserts who they are)'}")
     print(f"stations         {len(stations)} associated")
     for s in stations:
@@ -843,9 +1861,10 @@ def cmd_status(pol: dict) -> int:
 
 
 def main() -> int:
-    cmds = {"configure": cmd_configure, "preflight": cmd_preflight,
-            "render": cmd_render, "up": cmd_up, "down": cmd_down,
-            "status": cmd_status}
+    cmds = {"configure": cmd_configure, "autoconfigure": cmd_autoconfigure,
+            "set-mode": cmd_set_mode, "set-list": cmd_set_list,
+            "preflight": cmd_preflight, "render": cmd_render,
+            "up": cmd_up, "down": cmd_down, "status": cmd_status}
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print(__doc__)
         return 0

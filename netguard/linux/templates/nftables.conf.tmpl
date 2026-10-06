@@ -46,10 +46,8 @@ table ip themis_nat {
   chain prerouting {
     type nat hook prerouting priority dstnat; policy accept;
 
-    # Send ANY plain-HTTP request to the portal, whatever address it was aimed at.
-    # Without this a browser holding a cached IP, or a student typing one, bypasses
-    # the DNS sinkhole entirely and just hangs.
-    iifname "{{AP_IF}}" tcp dport 80 ip daddr != {{SRV}} dnat to {{SRV}}
+{{REDIRECT_BLOCK}}
   }
 {{NAT_POSTROUTING}}
 }
+{{BRIDGE_TABLE}}
