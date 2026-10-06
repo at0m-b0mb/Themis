@@ -451,6 +451,32 @@ def serve(*, bind: str, port: int, allow, block, mode: str, upstream_port: int,
         signal.signal(signal.SIGHUP, reload_lists)
     except (ImportError, ValueError, OSError):
         pass
+
+    def _watch_policy() -> None:
+        """Reload whenever the policy file changes on disk.
+
+        A signal is easy to forget and easy to send to the wrong pid, and
+        forgetting it produces the most confusing failure available here: the
+        file says the site is allowed, the operator panel says it is allowed,
+        and the student is still refused -- with nothing anywhere reporting a
+        disagreement. Watching the mtime closes that gap, so editing the list by
+        any route takes effect within a couple of seconds whether or not anybody
+        remembers to signal anything.
+        """
+        last = None
+        while True:
+            try:
+                stamp = policy_path.stat().st_mtime
+            except OSError:
+                stamp = None
+            if stamp is not None and last is not None and stamp != last:
+                print("  policy.json changed on disk", flush=True)
+                reload_lists()
+            last = stamp
+            time.sleep(2.0)
+
+    if policy_path:
+        threading.Thread(target=_watch_policy, daemon=True).start()
     print(f"themis-proxy on {bind}:{port}")
     if mode == "block":
         print(f"  mode         BLOCKLIST -- everything works except the names below")
@@ -467,7 +493,8 @@ def serve(*, bind: str, port: int, allow, block, mode: str, upstream_port: int,
     print("  Names are checked, addresses are not trusted, and TLS is not")
     print("  terminated -- no certificate is involved and no content is read.")
     if policy_path:
-        print(f"  Send SIGHUP to reload the lists without dropping the exam.")
+        print(f"  Watching {policy_path.name}: list changes apply within ~2s,")
+        print(f"  with no restart and nobody disconnected. SIGHUP also works.")
     print()
     try:
         srv.serve_forever(poll_interval=0.3)
