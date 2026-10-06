@@ -38,6 +38,7 @@ from themis import views
 from themis.state import ACTIVE_JOURNAL, ensure_dirs
 from themis.journal import Journal
 from themis.leases import hostapd_stations, read_leases, resolve
+from themis.activity import current_ips, read_activity
 from themis.roster import build_roster
 
 # Student IDs end up in filenames, logs and HTML. Keep them boring.
@@ -339,10 +340,24 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
         # Values below are interpolated into innerHTML by the console's script, so
         # they are escaped HERE. A student's own name is the injection vector.
+        # What the NETWORK was asked for, per student. Not device inspection and
+        # not page contents: the proxy splices TLS without terminating it, so a
+        # hostname is the most it can ever know. The console labels it that way.
+        acts = read_activity()
+        now_ip = current_ips(read_leases(self.ctx.lease_file), roster.registrations)
+
         students = []
         for sid in sorted(roster.registrations):
             reg = roster.registrations[sid]
             pres = roster.presence.get(sid)
+            act = acts.get(now_ip.get(sid, ""), None)
+            sites = [{"host": views.esc(x.host), "allowed": x.allowed,
+                      "blocked": x.blocked,
+                      "at": time.strftime("%H:%M", time.localtime(x.last_ts))}
+                     for x in (act.top(6) if act else [])]
+            refused = [{"host": views.esc(x.host), "n": x.blocked,
+                        "at": time.strftime("%H:%M", time.localtime(x.last_ts))}
+                       for x in (act.top(5, blocked=True) if act else [])]
             lo, hi = pres.total_absence_bounds(end) if pres else (0.0, 0.0)
             # "Left and never came back" is the single most important state on this
             # page, so it is a fact in the payload rather than something the front
@@ -360,6 +375,12 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 "never_returned": never_back,
                 "last_seen": (time.strftime("%H:%M", time.localtime(pres.last_seen))
                               if pres and pres.last_seen else ""),
+                "ip": views.esc(now_ip.get(sid, "")),
+                "asked_for": views.esc(act.latest_allowed) if act and act.latest_allowed else "",
+                "allowed_n": act.allowed_total if act else 0,
+                "refused_n": act.blocked_total if act else 0,
+                "sites": sites,
+                "refused": refused,
             })
 
         elapsed = "—"

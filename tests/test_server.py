@@ -386,3 +386,73 @@ class TestPresenceSourceIsHonest(Harness):
         self.ctx.journal.append("presence_sample", {"macs": [], "source": "hostapd"})
         d = json.loads(self.get("/api/state", port=self.cport)[1])
         self.assertFalse(d["presence_degraded"])
+
+
+class TestActivityAttribution(unittest.TestCase):
+    """What the NETWORK was asked for, grouped by the student who asked.
+
+    Names only, and never page contents: the proxy splices TLS rather than
+    terminating it, so a hostname is the most this can ever know. The console
+    says "asked for" rather than "is doing" for that reason.
+    """
+
+    def _log(self, lines):
+        p = Path(tempfile.mkdtemp()) / "decisions.log"
+        p.write_text("\n".join(lines) + "\n")
+        return p
+
+    def test_groups_by_client_and_counts_both_verdicts(self):
+        from themis.activity import read_activity
+        p = self._log([
+            "2026-10-05 22:00:01 allowed  10.83.0.70      canvas.jhu.edu  on the exam allowlist",
+            "2026-10-05 22:00:02 allowed  10.83.0.70      canvas.jhu.edu  on the exam allowlist",
+            "2026-10-05 22:00:03 blocked  10.83.0.70      chatgpt.com  not on the exam allowlist",
+            "2026-10-05 22:00:04 blocked  10.83.0.71      www.perplexity.ai  not on the exam allowlist",
+        ])
+        a = read_activity(p)
+        self.assertEqual(sorted(a), ["10.83.0.70", "10.83.0.71"])
+        self.assertEqual(a["10.83.0.70"].allowed_total, 2)
+        self.assertEqual(a["10.83.0.70"].blocked_total, 1)
+        self.assertEqual(a["10.83.0.70"].sites["canvas.jhu.edu"].allowed, 2)
+        self.assertEqual(a["10.83.0.70"].latest_allowed, "canvas.jhu.edu")
+
+    def test_a_hostname_off_the_wire_is_validated_not_trusted(self):
+        # The host comes from a student's ClientHello, and the console puts it on
+        # screen. Anything that is not a hostname is counted but never named.
+        from themis.activity import read_activity
+        p = self._log([
+            "2026-10-05 22:00:01 blocked  10.83.0.70      (no  SNI)",
+            "2026-10-05 22:00:02 blocked  10.83.0.70      <script>alert(1)</script>  x",
+            "2026-10-05 22:00:03 blocked  10.83.0.70      ok.example.com  x",
+        ])
+        a = read_activity(p)["10.83.0.70"]
+        self.assertEqual(sorted(a.sites), ["ok.example.com"])
+        self.assertEqual(a.unnamed, 2)
+        self.assertEqual(a.blocked_total, 3, "refusals still count even when unnamed")
+
+    def test_a_missing_log_is_empty_not_an_error(self):
+        # Every air-gapped exam runs with no proxy at all; the console must still
+        # render rather than fail to load.
+        from themis.activity import read_activity
+        self.assertEqual(read_activity(Path("/nonexistent/decisions.log")), {})
+
+    def test_malformed_lines_are_skipped(self):
+        from themis.activity import read_activity
+        p = self._log(["garbage", "", "2026-13-45 99:99:99 allowed 1.2.3.4 x  y",
+                       "2026-10-05 22:00:01 allowed  10.83.0.70      canvas.jhu.edu  ok"])
+        a = read_activity(p)
+        self.assertEqual(list(a), ["10.83.0.70"])
+
+    def test_the_current_address_wins_over_the_registered_one(self):
+        """DHCP hands out a new address after a renewal.
+
+        Attributing by the stale one shows a student doing nothing -- or, worse,
+        shows them doing whatever the next device to get that address did.
+        """
+        from themis.activity import current_ips
+        from types import SimpleNamespace
+        regs = {"s1": SimpleNamespace(mac="aa:bb:cc:00:00:01", ip="10.83.0.50")}
+        leases = [SimpleNamespace(mac="aa:bb:cc:00:00:01", ip="10.83.0.99")]
+        self.assertEqual(current_ips(leases, regs)["s1"], "10.83.0.99")
+        self.assertEqual(current_ips([], regs)["s1"], "10.83.0.50",
+                         "and the registered address is the fallback")

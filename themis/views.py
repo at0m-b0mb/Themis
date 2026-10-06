@@ -110,8 +110,11 @@ DISCLOSURE = """
   <ul>
     <li>Your device's network address, the name you enter below, and the times your
         device joins or leaves this network.</li>
-    <li>Which names your device asked this network to look up. There is no internet
-        connection here, so nothing can be reached.</li>
+    <li>Which site names your device asks this network for, whether each one was
+        allowed or refused, and when. The proctor can see that list next to your
+        name. It is names only: this network does not decrypt anything, so what
+        you open on an allowed site, what you type into it, and what it sends
+        back are not visible here.</li>
     <li><strong>Nothing is installed on your computer. Nothing looks at what is on
         it or running on it. No camera, no microphone, no screen recording.</strong></li>
     <li>If your device drops off, that is recorded — but it is never marked against
@@ -241,6 +244,28 @@ CONSOLE_CSS = """
 @media (max-width:560px){ .grid{grid-template-columns:1fr} }
 """
 
+CONSOLE_CSS += """
+/* What the network was asked for, per student. */
+.net{margin-top:.55rem; padding-top:.5rem; border-top:1px solid var(--line)}
+.netline{font-size:.82rem}
+.netline .got{color:var(--ok)}
+.netline b{font-family:ui-monospace,Menlo,monospace; font-weight:600}
+.netline .muted, .net .muted{color:var(--muted)}
+.netcount{font-size:.74rem; color:var(--muted); margin-top:.1rem;
+  font-variant-numeric:tabular-nums}
+ul.sites{list-style:none; margin:.4rem 0 0; padding:0; font-size:.74rem;
+  font-family:ui-monospace,Menlo,monospace}
+ul.sites li{display:flex; gap:.5rem; align-items:baseline; padding:.1rem 0}
+ul.sites li .h{flex:1 1 auto; overflow:hidden; text-overflow:ellipsis;
+  white-space:nowrap}
+ul.sites li .n{flex:0 0 auto; font-variant-numeric:tabular-nums}
+ul.sites li .t{flex:0 0 auto; color:var(--muted)}
+ul.sites li.got .h{color:var(--ink)}
+ul.sites li.ref .h{color:var(--muted)}
+ul.sites li.ref .n{color:var(--warn)}
+ul.sites li.got .n{color:var(--ok)}
+"""
+
 CONSOLE_JS = """
 let lastOk = Date.now();
 let lastPayload = null;   // re-rendering identical data just makes the page flash
@@ -273,11 +298,38 @@ function card(s){
     gap   = `<span style="color:var(--muted)">no gaps</span>`;
   }
   const seat = s.seat ? `<span class="seat">seat ${s.seat}</span>` : '';
+
+  // What the NETWORK was asked for. Deliberately worded as "asked for" and not
+  // "is doing": the proxy splices TLS without terminating it, so a hostname is
+  // the most that can ever be known here. A tile saying canvas.jhu.edu means
+  // the device requested Canvas, not that the student is working -- and a
+  // refusal does not mean they tried to cheat, because a phone reaches for
+  // iCloud on its own. Writing the stronger claim on screen would invite a
+  // reader to treat a question as an answer.
+  let net = '';
+  if (s.asked_for || s.allowed_n || s.refused_n){
+    const rows = (s.sites||[]).map(x =>
+      `<li class="${x.blocked && !x.allowed ? 'ref' : 'got'}">`
+      + `<span class="h">${x.host}</span>`
+      + `<span class="n">${x.allowed ? x.allowed + '\u2713' : ''}`
+      + `${x.blocked ? ' ' + x.blocked + '\u2717' : ''}</span>`
+      + `<span class="t">${x.at}</span></li>`).join('');
+    net = `<div class="net">
+      <div class="netline">${s.asked_for
+          ? `<span class="got">reaching <b>${s.asked_for}</b></span>`
+          : `<span class="muted">nothing reached yet</span>`}</div>
+      <div class="netcount">${s.allowed_n} allowed \u00b7 ${s.refused_n} refused</div>
+      ${rows ? `<ul class="sites">${rows}</ul>` : ''}
+    </div>`;
+  }
+
   return `<div class="who ${cls}">
     <div class="nm">${s.name}${seat}</div>
-    <div class="id">${s.student_id} \u00b7 <span class="dev">${s.mac}</span></div>
+    <div class="id">${s.student_id} \u00b7 <span class="dev">${s.mac}</span>${
+      s.ip ? ` \u00b7 <span class="dev">${s.ip}</span>` : ''}</div>
     <div class="st">${state}</div>
     <div class="st">${gap}</div>
+    ${net}
   </div>`;
 }
 
