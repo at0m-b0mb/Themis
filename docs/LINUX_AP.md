@@ -132,8 +132,14 @@ review and closes the one gap the chain cannot cover by itself.
   disassociation the instant they happen, with the station MAC and a reason code.
   `themis-sta-hook` writes each one into the hash-chained journal. Polling DHCP
   leases could only notice, seconds later, that a device had stopped answering.
-- **Client isolation at the radio** (`ap_isolate=1`), with the nftables `forward`
-  chain dropping everything as a second layer.
+- **Client isolation at the radio** (`ap_isolate=1`). For two students on the
+  *same* radio this is the whole of it: their frames are relayed inside the radio
+  at layer 2 and never reach the nftables `forward` hook, so the firewall cannot
+  and does not back it up. (This page used to claim it did. The code, the threat
+  model and a dedicated test all say otherwise.) With two radios there *is* a
+  genuine second layer, but only across them: `table bridge themis_iso` drops
+  frames forwarded between bridge ports, which is what stops a 2.4 GHz student
+  reaching a 5 GHz one.
 - **WPA2-Enterprise is reachable.** Flip `enterprise.enabled` in the policy and
   hostapd's built-in EAP server gives every student their own credential, so
   identity is bound to a MAC cryptographically at association, before any web

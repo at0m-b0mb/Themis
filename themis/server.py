@@ -38,6 +38,7 @@ from themis import views
 from themis.state import ACTIVE_JOURNAL, ensure_dirs
 from themis.journal import Journal
 from themis.leases import hostapd_stations, read_leases, resolve
+from themis.activity import current_ips, read_activity
 from themis.roster import build_roster
 
 # Student IDs end up in filenames, logs and HTML. Keep them boring.
@@ -70,9 +71,44 @@ class Context:
         self.policy = policy
         self.journal = Journal(journal_path)
         self.lock = threading.Lock()
-        self.ap_interface = policy.get("ap_interface") or policy.get("exam_interface")
+        # Two interfaces, two different jobs, and conflating them breaks both.
+        #
+        #   radio_interfaces -- the RADIOS, asked over hostapd_cli. With two of
+        #       them, asking only the first makes every student on the other band
+        #       read as absent for the whole exam.
+        #   student_interface -- the L3 interface students actually arrive on,
+        #       used for ARP. With two radios the exam address sits on the BRIDGE,
+        #       so filtering /proc/net/arp by a radio name yields nothing and no
+        #       registration can ever be corroborated.
+        #
+        # `hostapd_cli -i br-themis` does not work and `arp filtered by wlan0`
+        # finds nothing, so neither name can stand in for the other.
+        raw = policy.get("radios") or [{"interface": policy.get("ap_interface")
+                                        or policy.get("exam_interface")}]
+        self.radio_interfaces = [str(r["interface"]) for r in raw if r.get("interface")]
+        self.ap_interface = self.radio_interfaces[0] if self.radio_interfaces else None
+        self.student_interface = self._student_interface(policy)
         self.lease_file = Path(policy.get("lease_file", "/run/themis/dhcp.leases"))
         self._recent: dict[str, float] = {}   # ip -> last registration attempt
+
+    @staticmethod
+    def _student_interface(policy: dict) -> str | None:
+        """Where students arrive at layer 3: the bridge, or the single radio.
+
+        Preferring what is actually RUNNING (state.json, written by themis-ap at
+        `up`) over what the policy currently says, because the policy can be
+        edited mid-exam and the ARP table belongs to the network that is up.
+        """
+        try:
+            st = json.loads(Path("/run/themis/state.json").read_text())
+            iface = st.get("ap_interface")
+            if iface:
+                return str(iface)
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+        if policy.get("radios"):
+            return str(policy.get("bridge") or "br-themis")
+        return policy.get("ap_interface") or policy.get("exam_interface")
 
     def registered_ids(self) -> dict[str, dict]:
         return {e.data.get("student_id"): e.data
@@ -105,16 +141,39 @@ class Context:
         network. So the source travels with the sample, and the console says plainly
         when it is no longer hearing from the radio.
         """
-        if self.ap_interface:
-            sta = hostapd_stations(self.ap_interface)
-            if sta is not None:
-                return sta, "hostapd"
+        answered: set[str] = set()
+        asked = silent = 0
+        for iface in self.radio_interfaces:
+            asked += 1
+            sta = hostapd_stations(iface)
+            if sta is None:
+                silent += 1
+            else:
+                answered |= sta
+
         now = time.time()
         leases = {l.mac for l in read_leases(self.lease_file) if not l.expired(now)}
+
+        if asked and silent == 0:
+            return answered, "hostapd"
+        if asked and silent < asked:
+            # One radio answered and another did not. Reporting just the union of
+            # the radios that replied would read as every student on the silent
+            # band leaving at the same instant -- the precise fiction this method
+            # exists to avoid -- so the leases stand in for the band we cannot ask,
+            # and the sample says it is partial.
+            return answered | leases, "hostapd_partial"
         return leases, "leases"
 
 
 class StudentHandler(BaseHTTPRequestHandler):
+    # A read deadline. Without it a client that opens a connection and sends
+    # nothing holds its thread forever, and the proctor console runs in THIS
+    # process -- so enough half-open connections from one laptop take the
+    # console down along with the exam page. BaseHTTPRequestHandler wraps
+    # handle_one_request in `except TimeoutError`, so this costs nothing on the
+    # exam path and simply closes a connection that has stopped talking.
+    timeout = 10
     server_version = "Themis"
     sys_version = ""
     ctx: Context = None  # set by serve()
@@ -152,7 +211,7 @@ class StudentHandler(BaseHTTPRequestHandler):
     def _resolve(self):
         return resolve(self.client_ip,
                        lease_file=self.ctx.lease_file,
-                       interface=self.ctx.ap_interface)
+                       interface=self.ctx.student_interface)
 
     # -- routes ------------------------------------------------------------ #
 
@@ -231,6 +290,7 @@ class StudentHandler(BaseHTTPRequestHandler):
 
 
 class ConsoleHandler(BaseHTTPRequestHandler):
+    timeout = 10
     """The proctor's view. Loopback-only, and nftables does not permit the port
     either -- two independent reasons, because this lists every student's name and
     device."""
@@ -280,10 +340,24 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
         # Values below are interpolated into innerHTML by the console's script, so
         # they are escaped HERE. A student's own name is the injection vector.
+        # What the NETWORK was asked for, per student. Not device inspection and
+        # not page contents: the proxy splices TLS without terminating it, so a
+        # hostname is the most it can ever know. The console labels it that way.
+        acts = read_activity()
+        now_ip = current_ips(read_leases(self.ctx.lease_file), roster.registrations)
+
         students = []
         for sid in sorted(roster.registrations):
             reg = roster.registrations[sid]
             pres = roster.presence.get(sid)
+            act = acts.get(now_ip.get(sid, ""), None)
+            sites = [{"host": views.esc(x.host), "allowed": x.allowed,
+                      "blocked": x.blocked,
+                      "at": time.strftime("%H:%M", time.localtime(x.last_ts))}
+                     for x in (act.top(6) if act else [])]
+            refused = [{"host": views.esc(x.host), "n": x.blocked,
+                        "at": time.strftime("%H:%M", time.localtime(x.last_ts))}
+                       for x in (act.top(5, blocked=True) if act else [])]
             lo, hi = pres.total_absence_bounds(end) if pres else (0.0, 0.0)
             # "Left and never came back" is the single most important state on this
             # page, so it is a fact in the payload rather than something the front
@@ -301,6 +375,12 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 "never_returned": never_back,
                 "last_seen": (time.strftime("%H:%M", time.localtime(pres.last_seen))
                               if pres and pres.last_seen else ""),
+                "ip": views.esc(now_ip.get(sid, "")),
+                "asked_for": views.esc(act.latest_allowed) if act and act.latest_allowed else "",
+                "allowed_n": act.allowed_total if act else 0,
+                "refused_n": act.blocked_total if act else 0,
+                "sites": sites,
+                "refused": refused,
             })
 
         elapsed = "—"
@@ -395,7 +475,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         for sid in sorted(roster.registrations):
             reg = roster.registrations[sid]
             p = roster.presence.get(sid)
-            w(f"{reg.name}  ({sid})" + (f"  seat {reg.seat}" if reg.seat else ""))
+            w(f"{_flat(reg.name, 80)}  ({sid})"
+              + (f"  seat {_flat(reg.seat, 24)}" if reg.seat else ""))
             w(f"    device        {reg.mac}  [{reg.resolution_source}]")
             w(f"    signed in     {time.strftime('%H:%M:%S', time.localtime(reg.at))}")
             if len(earlier.get(sid, [])) > 1:
@@ -429,15 +510,40 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         return "\n".join(L) + "\n"
 
 
+def _flat(value, limit: int) -> str:
+    """One line, bounded, for the plain-text record.
+
+    The student types their own name, and this file is the authoritative record
+    a human reads when deciding what a gap meant. A name containing a newline
+    does not look like a bad name here -- it looks like ANOTHER STUDENT'S ENTRY,
+    complete with an id and a seat, forged by the student being reviewed. The
+    hash chain cannot help: the forged text was faithfully journalled, so the
+    chain verifies as perfectly intact over it.
+    //
+    Flattening at the RENDERER is what makes this safe retroactively. Events
+    already written cannot be edited without breaking the chain, so any name
+    journalled before this fix stays tainted forever and only the thing that
+    prints it can neutralise it.
+    """
+    return " ".join(str(value).split())[:limit]
+
+
 def presence_loop(ctx: Context, interval: float, stop: threading.Event):
     while not stop.wait(interval):
+        # The append belongs INSIDE the guard. Outside it, a single transient
+        # journal write error -- a full disk, a momentary EIO -- raises out of
+        # the loop and ends presence sampling for the rest of the exam, while
+        # the console carries on showing the last sample and saying "live".
+        # Silence is the one failure mode this record must never have.
         try:
             macs, source = ctx.observe_macs()
-        except Exception:
-            continue  # a sampling failure must never take the portal down
-        with ctx.lock:
-            ctx.journal.append("presence_sample",
-                               {"macs": sorted(macs), "source": source})
+            with ctx.lock:
+                ctx.journal.append("presence_sample",
+                                   {"macs": sorted(macs), "source": source})
+        except Exception as e:                       # noqa: BLE001
+            print(f"themis: presence sample failed ({e!r}); still sampling",
+                  file=sys.stderr, flush=True)
+            continue
 
 
 def review(policy: dict, *, journal_path: Path, console_port: int) -> int:

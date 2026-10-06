@@ -13,6 +13,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import os  # noqa: E402
+from themis import journal, state  # noqa: E402
 from themis.journal import GENESIS, Journal, event_hash  # noqa: E402
 
 
@@ -148,10 +150,6 @@ class TestHashConstruction(JournalCase):
                          event_hash(1, 2.0, "k", {"b": 2, "a": 1}, GENESIS))
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class TestConcurrentWriters(JournalCase):
     """Two processes really do write this file during an exam: the server, and the
     hostapd event hook that hostapd_cli spawns fresh per association.
@@ -224,3 +222,80 @@ class TestRecordIsNotEphemeral(unittest.TestCase):
         self.assertIsNotNone(dest)
         self.assertTrue(dest.exists())
         self.assertFalse(d.exists(), "the new exam must start on a clean chain")
+
+
+class TestStartExamNeverArchivesALiveRecord(unittest.TestCase):
+    """The panel's "Start the exam" archives the journal as its FIRST action.
+
+    Doing that while a portal is appending renames the file out from under the
+    writer, which then opens a fresh chain at seq 0. Every student registered so
+    far vanishes from the console, verify() reports the new two-event chain as
+    perfectly intact, and nothing anywhere records that a record was lost. The
+    button was wrongly enabled for entire dual-band exams, so this was reachable
+    by an operator doing nothing unusual.
+    """
+
+    def _controller(self, run_dir: Path):
+        from themis import operator as op
+        ctl = op.Controller.__new__(op.Controller)
+        ctl.portal = None
+        ctl.last = {}
+        return ctl, op
+
+    def test_it_refuses_while_a_portal_is_alive(self):
+        import os
+        from unittest import mock
+        run = Path(tempfile.mkdtemp())
+        ctl, op = self._controller(run)
+        with mock.patch.object(op, "RUN_DIR", run), \
+             mock.patch.object(ctl.__class__, "ap_running", lambda self: False), \
+             mock.patch.object(ctl.__class__, "portal_running", lambda self: True):
+            ok, msg = op.Controller.start_exam(ctl)
+        self.assertFalse(ok)
+        self.assertIn("NOT touched", msg)
+
+    def test_it_refuses_while_the_radio_is_up(self):
+        from unittest import mock
+        run = Path(tempfile.mkdtemp())
+        ctl, op = self._controller(run)
+        with mock.patch.object(op, "RUN_DIR", run), \
+             mock.patch.object(ctl.__class__, "ap_running", lambda self: True), \
+             mock.patch.object(ctl.__class__, "portal_running", lambda self: False):
+            ok, msg = op.Controller.start_exam(ctl)
+        self.assertFalse(ok)
+        self.assertIn("already running", msg)
+
+    def test_ap_running_sees_a_per_radio_pid_file(self):
+        from unittest import mock
+        from themis import operator as op
+        run = Path(tempfile.mkdtemp())
+        (run / "hostapd-wlan1.pid").write_text(str(os.getpid()))
+        ctl = op.Controller.__new__(op.Controller)
+        with mock.patch.object(op, "RUN_DIR", run):
+            self.assertTrue(op.Controller.ap_running(ctl),
+                            "dual-band writes hostapd-<iface>.pid, never hostapd.pid")
+
+    def test_archiving_a_live_journal_would_lose_the_roster(self):
+        """The damage itself, so the guard above is anchored to a real harm."""
+        d = Path(tempfile.mkdtemp())
+        jp = d / "exam.jsonl"
+        j = journal.Journal(jp)
+        j.append("exam_open", {})
+        for sid in ("s01", "s02", "s03"):
+            j.append("register", {"student_id": sid, "mac": f"aa:bb:cc:00:00:{sid[-1]}"})
+        before = len(list(j.read()))
+        state.archive_previous(jp)
+        j.append("presence_sample", {"macs": []})      # the still-running portal
+        reopened = journal.Journal(jp)
+        after = list(reopened.read())
+        self.assertEqual(before, 4)
+        self.assertEqual(len(after), 1, "the roster is gone from the active journal")
+        self.assertEqual(after[0].seq, 0, "and the chain silently restarted at zero")
+        self.assertTrue(reopened.verify().ok,
+                        "while still verifying as intact -- which is exactly why "
+                        "this needs a guard up front rather than an integrity "
+                        "check afterwards")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

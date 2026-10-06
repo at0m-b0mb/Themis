@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Refuse to commit a live exam passphrase.
+#
+# Install it:
+#     ln -sf ../../tools/pre-commit .git/hooks/pre-commit
+#
+# policy.json is tracked because it is the documented configuration and the test
+# suite reads it, but during an exam it holds the passphrase actually in use --
+# and `themis-ap autoconfigure` mints a new one on every run, so the file is
+# almost always dirty with a secret in it. That makes `git add -A` a loaded gun,
+# and it has gone off: a commit went in with a live passphrase and had to be
+# amended before it reached a public remote.
+#
+# This hook checks the STAGED content, not the working tree, so you can keep the
+# real passphrase locally and still commit everything else.
+set -u
+
+fail=0
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+
+for f in $staged; do
+  case "$f" in
+    *policy.json)
+      value=$(git show ":$f" 2>/dev/null \
+              | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("passphrase",""))
+except Exception: print("")' 2>/dev/null)
+      if [ -n "$value" ] && [ "$value" != "CHANGE-ME-EVERY-EXAM" ]; then
+        printf '\033[31mpre-commit: %s has a real passphrase staged.\033[0m\n' "$f" >&2
+        printf '  A committed exam passphrase is a published one. Stage the\n' >&2
+        printf '  placeholder instead and keep the live value in your working tree:\n\n' >&2
+        printf '    python3 - <<PY\n' >&2
+        printf "    import json, pathlib\n" >&2
+        printf "    p = pathlib.Path('%s')\n" "$f" >&2
+        printf "    d = json.loads(p.read_text()); live = d['passphrase']\n" >&2
+        printf "    d['passphrase'] = 'CHANGE-ME-EVERY-EXAM'\n" >&2
+        printf "    p.write_text(json.dumps(d, indent=2) + chr(10))\n" >&2
+        printf "    print('live value was:', live)\n" >&2
+        printf '    PY\n\n' >&2
+        printf '  Then: git add %s && git commit ... and put the live value back.\n' "$f" >&2
+        fail=1
+      fi
+      ;;
+  esac
+done
+
+# A generic backstop for the other way a key reaches a commit.
+#
+# The bracketed letters matter: without them this pattern matches the line it is
+# written on, so staging THIS FILE trips its own check. (It did, on the very
+# commit that added it.) Excluding the hook from the diff is the other half,
+# since the usage text above also spells the names out.
+if git diff --cached -U0 -- . ':(exclude)tools/pre-commit' \
+   | grep -nE '^\+.*(BEGIN [A-Z ]*PRIVATE KEY|wpa_passphras[e]=|sae_passwor[d]=)' >/dev/null 2>&1; then
+  printf '\033[31mpre-commit: a private key or a rendered hostapd secret is staged.\033[0m\n' >&2
+  printf '  Rendered configs belong in /run/themis, not in the repository.\n' >&2
+  fail=1
+fi
+
+[ "$fail" = 0 ] || {
+  printf '\n  (Reviewed it and still want this? git commit --no-verify)\n' >&2
+  exit 1
+}
+exit 0
