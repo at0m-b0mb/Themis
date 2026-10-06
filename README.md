@@ -173,6 +173,22 @@ Open <http://127.0.0.1:8899/>. That generates a 19-student, 90-minute exam and
 opens it read-only — nothing is written, so it is also exactly how you reopen a
 real exam's record afterwards.
 
+Each tile shows the student, whether their device is on the network, any gaps
+with timestamp *bounds* rather than false precision, and **what the network was
+asked for**: the site currently being reached, how many requests were allowed and
+refused, and the recent hostnames with counts. A student working shows
+`canvas.jhu.edu` and some background chatter from their phone; a student reaching
+for an AI tool shows dozens of refusals to one name, which is visible at a glance
+across 28 tiles.
+
+That phrasing is exact and the console uses it on screen. The proxy splices TLS
+without terminating it, so a **hostname is the most that can ever be known** —
+the page opened on an allowed site, what was typed into it and what came back are
+invisible, and no amount of future work here will change that. A tile reading
+`canvas.jhu.edu` means the device requested Canvas, not that the student is
+working, and a refusal does not mean anyone tried to cheat: a phone reaches for
+iCloud on its own. These are questions worth asking, never answers.
+
 ## What is honestly out of reach
 
 | | |
@@ -219,6 +235,26 @@ docs/
 
 ## Status
 
-Pre-release. The network layer is written and both pf profiles validate under
-`pfctl -n`, but **nothing here has been run against 19 real laptops yet.** Do
-the dress rehearsal in `docs/NETWORK_SETUP.md` before it counts for marks.
+**v0.2.0.** Proven end to end against real hardware, and not yet proven at class
+scale. Both of those matter, so be specific about which is which.
+
+What has actually been run: two MT7921U adapters bridged under one SSID on 2.4
+and 5 GHz; real devices associating on both bands; a complete JHU Canvas login
+through Shibboleth, Entra and a FIDO passkey bridge; Canvas rendering and its
+file service reachable; and a live blocking check in which a forbidden SNI was
+refused *even when aimed at Canvas's own IP address*, while an allowed SNI aimed
+at an arbitrary address still landed on real Canvas. Tailscale's control plane
+and DERP relays, Perplexity, ChatGPT, Claude and Grammarly were all refused on
+genuine device traffic, and a WireGuard tunnel reported "connected" while moving
+zero bytes.
+
+What has **not** been run: 28 laptops at once, a real submission at the moment
+students hit submit, and coverage from the back of the actual room. Those are the
+three things the dress rehearsal in `docs/NETWORK_SETUP.md` exists to find, and
+none of them can be inferred from a bench test.
+
+Before it counts for marks:
+
+```bash
+sudo bash tools/verify_blocking.sh    # what the LIVE network refuses, right now
+```
