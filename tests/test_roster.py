@@ -131,10 +131,6 @@ class TestPresence(unittest.TestCase):
         self.assertIn("s01", r.flagged())
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class TestReopenedExamClearsTheStaleClose(unittest.TestCase):
     """Restarting the portal writes exam_close and then exam_open.
 
@@ -180,3 +176,7 @@ class TestReopenedExamClearsTheStaleClose(unittest.TestCase):
         longest = max(g.duration_bounds(r.closed_at or (T0 + 120))[1] for g in gaps)
         self.assertGreater(longest, 30.0,
                            "a gap measured against a stale close clamps to zero")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

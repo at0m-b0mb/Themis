@@ -231,10 +231,6 @@ class TestBlacklistShipped(unittest.TestCase):
                           f"{mod} must be blacklisted -- it crashes mt7921u Wi-Fi on 6.6+")
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class TestNftSyntaxTraps(unittest.TestCase):
     """nft is unavailable on the macOS dev host, so the syntax rules it would have
     enforced are pinned here instead. Each of these shipped broken once."""
@@ -767,3 +763,7 @@ class TestRadioPlanning(unittest.TestCase):
         radios, _ = self._plan(caps)
         ch = next(r["channel"] for r in radios if ap.band_of(r["channel"]) == "2.4")
         self.assertIn(ch, ap.CLEAN_24GHZ)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -125,8 +125,9 @@ precisely because it hides nothing:
 
 - The exam runs on a local network with no internet access.
 - DNS queries and DHCP leases on that network are logged for the exam duration.
-- The exam page sends a heartbeat; if your device leaves the network, that gap
-  is recorded and a proctor may ask you about it.
+- If your device leaves the network, the access point notices and that gap is
+  recorded; a proctor may ask you about it. Nothing on your device reports this
+  — the signal comes from the access point you connected to.
 - **Nothing is installed on your laptop. Nothing inspects your device. No
   camera, no microphone, no screen capture.**
 - Logs are deleted after grades are final. (Pick the date. Honour it.)

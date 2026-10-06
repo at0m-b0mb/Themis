@@ -150,10 +150,6 @@ class TestHashConstruction(JournalCase):
                          event_hash(1, 2.0, "k", {"b": 2, "a": 1}, GENESIS))
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class TestConcurrentWriters(JournalCase):
     """Two processes really do write this file during an exam: the server, and the
     hostapd event hook that hostapd_cli spawns fresh per association.
@@ -299,3 +295,7 @@ class TestStartExamNeverArchivesALiveRecord(unittest.TestCase):
                         "while still verifying as intact -- which is exactly why "
                         "this needs a guard up front rather than an integrity "
                         "check afterwards")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

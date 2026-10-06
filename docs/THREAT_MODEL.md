@@ -23,7 +23,7 @@ Profile `airgap`, students on the exam SSID, two staff present:
 | Pre-staged answers on a USB stick | Not blocked | Out of scope for a network control. |
 | **Local AI model on their laptop** | **Not blocked** | A 4 GB model runs fully offline and emits no packets. No network control can see it. |
 | **Phone on cellular** | **Not blocked** | Never touches your network. |
-| **Switching to another WiFi** | **Detected, not prevented** | Heartbeat gap is logged with a timestamp. Preventing it is illegal — see below. |
+| **Switching to another WiFi** | **Detected, not prevented** | The radio reports the disassociation, and presence is sampled every 10s, so the gap is logged with timestamp *bounds*. Preventing it is illegal — see below. |
 
 The last three rows are the honest limit. They are handled by people, not code.
 
@@ -54,11 +54,17 @@ phone hotspot violates **§333 of the Communications Act**. The FCC fined
 Marriott **$600,000** for precisely this, and Hilton/MC Dean **$750,000**. It is
 a federal matter, not a policy preference, and it would expose the university.
 
-*Instead:* the exam page sends a heartbeat. If a client leaves the exam network
-the heartbeat stops, and the proctor console shows which seat went dark, when,
-and for how long. You have a TA and an instructor in the room — a red tile is
-all they need to walk over. Detection plus a human beats prevention that
-doesn't exist.
+*Instead:* the AP reports it. hostapd records association and disassociation the
+instant they happen, and the server additionally samples the associated stations
+every 10 seconds — so a departure is bounded by two samples rather than known to
+the second, and the console shows which seat went dark, between when and when.
+You have a TA and an instructor in the room; a red tile is all they need to walk
+over. Detection plus a human beats prevention that doesn't exist.
+
+Note what this is *not*: there is no heartbeat from the student's browser and no
+agent on their machine. Nothing on a student's device reports anything. The
+signal comes entirely from the radio they associated with, which is hardware the
+institution owns.
 
 ### 2. It does not scan student devices
 

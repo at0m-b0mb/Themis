@@ -208,7 +208,8 @@ docs/
 - [x] Name-validating proxy: allowlist/blocklist by SNI, no TLS interception
 - [x] Operator panel: adapter detection, mode, list editing, live refusals
 - [x] Live verification: `tools/verify_blocking.sh` against the running network
-- [ ] Exam server + proctor console: 28 live tiles, heartbeat gap detection
+- [x] Exam server + proctor console: live tiles, radio-reported presence,
+      per-student view of what the network was asked for
 - [ ] Per-student parameterised items → QTI 1.2 export (imports into Canvas,
       Moodle, Blackboard with no admin approval — the lowest-friction path to
       adoption by other universities)

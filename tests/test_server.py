@@ -276,10 +276,6 @@ class TestPresenceSampling(Harness):
         self.assertTrue(self.ctx.journal.events("presence_sample"))
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class TestConsoleApiAndReport(Harness):
     """The API feeds a script that writes into innerHTML, and the report is read by
     people who are not looking at this program. Both have to be right."""
@@ -456,3 +452,7 @@ class TestActivityAttribution(unittest.TestCase):
         self.assertEqual(current_ips(leases, regs)["s1"], "10.83.0.99")
         self.assertEqual(current_ips([], regs)["s1"], "10.83.0.50",
                          "and the registered address is the fallback")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
