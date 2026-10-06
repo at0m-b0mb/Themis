@@ -501,6 +501,38 @@ table.ref tr.allowed td.host{color:var(--ok)}
   cursor:pointer}
 .btn2:hover{border-color:var(--gold); color:var(--gold)}
 .empty{color:var(--muted); font-size:.85rem; margin:.6rem 0 0}
+
+/* --- the one line an operator glances at mid-exam --- */
+.statusbar{position:sticky; top:0; z-index:5; margin:0 0 1rem;
+  background:var(--panel); border:1px solid var(--line); border-radius:var(--radius);
+  padding:.6rem .9rem; display:flex; align-items:center; gap:.4rem .9rem;
+  flex-wrap:wrap; backdrop-filter:blur(8px)}
+.statusbar .pill{display:inline-flex; align-items:center; gap:.4rem;
+  font-size:.82rem; color:var(--muted)}
+.statusbar .pill b{color:var(--ink); font-family:ui-monospace,Menlo,monospace;
+  font-weight:600}
+.statusbar .live{width:.5rem; height:.5rem; border-radius:50%;
+  background:var(--muted); flex:none}
+.statusbar.up .live{background:var(--ok); box-shadow:0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent)}
+/* max-width:max-content is the load-bearing part. When the bar wraps, this ends
+   up alone on its line and is stretched to the full width -- a pill that is no
+   longer pill-shaped. flex:0 0 auto does NOT prevent it; measured in a browser,
+   the element went 673px -> 98px only once max-content was set. */
+.statusbar .mode{margin-left:auto; flex:0 0 auto; align-self:center;
+  max-width:max-content;
+  font-size:.74rem; font-weight:600; letter-spacing:.04em; text-transform:uppercase;
+  color:var(--gold); border:1px solid var(--gold); border-radius:999px;
+  padding:.15rem .6rem; white-space:nowrap}
+
+@media (max-width:640px){
+  .statusbar{position:static}
+  .statusbar .mode{margin-left:0}
+  .radio{flex-wrap:wrap; gap:.3rem .7rem}
+  .radio .sta{margin-left:0; width:100%}
+  table.ref td.act{display:block; text-align:left; padding-top:0}
+  .row{flex-direction:column; align-items:stretch}
+  .row button, .row a{width:100%; text-align:center}
+}
 """
 
 OPERATOR_JS = """
@@ -538,10 +570,24 @@ function radios(s){
     + `</div>`).join('') + '</div>';
 }
 
+function statusbar(s){
+  const live = s.ap_running && s.portal_running;
+  const total = (s.radios||[]).reduce((n,r)=>n + (r.stations||[]).length, 0);
+  const bands = (s.radios||[]).filter(r=>r.running).map(r=>r.band+' GHz').join(' + ') || 'none';
+  const el = document.getElementById('statusbar');
+  el.className = 'statusbar' + (live ? ' up' : '');
+  el.innerHTML = `<span class="pill"><span class="live"></span>`
+    + `<b>${esc(s.policy.ssid)}</b></span>`
+    + `<span class="pill">${live ? 'running' : 'stopped'}</span>`
+    + `<span class="pill">bands <b>${esc(bands)}</b></span>`
+    + `<span class="pill">students <b>${esc(total)}</b></span>`
+    + `<span class="mode">${esc(s.mode === 'allowlist-legacy' ? 'legacy' : s.mode)}</span>`;
+}
+
 function refusals(s){
   const rows = s.refusals || [];
-  if (!s.proxy_running) return '<p class="empty">The proxy is not running, so nothing is being refused yet.</p>';
-  if (!rows.length) return '<p class="empty">Nothing refused yet.</p>';
+  if (!s.proxy_running) return '<p class="empty">The proxy is not running, so nothing is being refused yet. In air-gapped mode nothing is reachable at all, so nothing is logged here.</p>';
+  if (!rows.length) return '<p class="empty">Nothing refused yet. Once students join, whatever their devices reach for that is not permitted will appear here.</p>';
   return '<table class="ref"><thead><tr><th>name a student asked for</th>'
     + '<th style="text-align:right">tries</th><th>last</th><th></th></tr></thead><tbody>'
     + rows.map(r =>
@@ -618,6 +664,7 @@ function render(s){
   document.getElementById('s5links').style.display = live ? 'flex' : 'none';
   document.getElementById('console').href = 'http://127.0.0.1:' + s.console_port + '/';
 
+  statusbar(s);
   document.getElementById('refusals').innerHTML = refusals(s);
 
   const out = document.getElementById('out');
@@ -692,6 +739,8 @@ def operator_page() -> str:
 
 <h1>Set up the exam</h1>
 <p class="sub">Nothing to type, and nothing here looks at a student's machine.</p>
+
+<div class="statusbar" id="statusbar"></div>
 
 <div class="step" id="s1">
   <h3><span class="num">1</span> This computer
