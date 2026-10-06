@@ -133,3 +133,50 @@ class TestPresence(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestReopenedExamClearsTheStaleClose(unittest.TestCase):
+    """Restarting the portal writes exam_close and then exam_open.
+
+    If the close is not cleared, every still-open gap is measured against an
+    instant already in the past and clamps to zero -- so the proctor is told a
+    student who has been gone twenty minutes has been gone 0s. Restarting the
+    portal mid-exam is documented as a normal thing to do, so an operator
+    reaches this on purpose.
+    """
+
+    def test_exam_open_clears_a_previous_close(self):
+        r = build_roster([
+            ev(0, T0, "exam_open", {}),
+            ev(1, T0 + 60, "exam_close", {}),
+            ev(2, T0 + 120, "exam_open", {}),
+        ])
+        self.assertIsNone(r.closed_at, "a reopened exam is not a closed one")
+        self.assertEqual(r.opened_at, T0 + 120)
+
+    def test_a_genuine_close_is_still_recorded(self):
+        r = build_roster([ev(0, T0, "exam_open", {}),
+                          ev(1, T0 + 60, "exam_close", {})])
+        self.assertEqual(r.closed_at, T0 + 60)
+
+    def test_a_gap_after_reopening_is_not_reported_as_zero(self):
+        # The symptom an operator actually sees: a student missing from every
+        # sample after the restart must not read as "gone 0s".
+        events = [ev(0, T0, "exam_open", {}),
+                  ev(1, T0 + 5, "register",
+                     {"student_id": "s1", "name": "S1", "mac": MAC_A,
+                      "ip": "10.83.0.51", "resolution_source": "both_agree"}),
+                  ev(2, T0 + 10, "presence_sample", {"macs": [MAC_A]}),
+                  ev(3, T0 + 20, "exam_close", {}),
+                  ev(4, T0 + 30, "exam_open", {})]
+        seq = 5
+        for i in range(8):                       # eight polls with nobody seen
+            events.append(ev(seq, T0 + 40 + i * 10.0, "presence_sample", {"macs": []}))
+            seq += 1
+        r = build_roster(events, min_gap_seconds=30.0)
+        self.assertIsNone(r.closed_at)
+        gaps = [g for pres in r.presence.values() for g in pres.gaps]
+        self.assertTrue(gaps, "the student stopped appearing; that is a gap")
+        longest = max(g.duration_bounds(r.closed_at or (T0 + 120))[1] for g in gaps)
+        self.assertGreater(longest, 30.0,
+                           "a gap measured against a stale close clamps to zero")

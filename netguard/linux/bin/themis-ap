@@ -640,7 +640,7 @@ def render(pol: dict) -> dict[str, str]:
             "RADIO_BLOCK": _radio_block(radio["channel"], radio["channel_width_mhz"]),
             "AUTH_BLOCK": auth_block,
             "AP_ISOLATE": 1 if pol.get("client_isolation", True) else 0,
-            "MAX_STA": pol.get("max_stations", 25),
+            "MAX_STA": pol.get("max_stations", 60),
         }.items():
             text = text.replace("{{%s}}" % k, str(v))
         # One radio keeps the original filename, so existing tooling and the test

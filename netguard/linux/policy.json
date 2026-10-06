@@ -13,7 +13,7 @@
   "_channel_comment": "mt7921u does NOT support DFS channels in AP mode. Stay on 36-48 or 149-165 (US). 36 with 80MHz width covers 36-48.",
   "channel": 36,
   "channel_width_mhz": 80,
-  "max_stations": 25,
+  "max_stations": 60,
   "client_isolation": true,
   "server_ip": "10.83.0.1",
   "netmask_bits": 24,
@@ -63,5 +63,6 @@
   "bridge": "br-themis",
   "_radios_comment": "One adapter beacons on one channel, so dual-band is two radios -- which is all a dual-band router is. Both carry the SAME ssid and passphrase and are bridged, so a student sees ONE network and their device picks the band. ap_interface below stays as the single-radio fallback and is ignored while 'radios' is set.",
   "proxy_mode": "allow",
-  "block_dns_names": []
+  "block_dns_names": [],
+  "_max_stations_comment": "Per-BSS station limit, so with two radios it applies to EACH band separately. Set far above any possible roster: hitting it is not a visible failure, it is hostapd replying 'unable to handle additional associated stations' and the laptop showing a generic 'cannot connect' -- indistinguishable from a student who never turned up. A laptop resuming from sleep can also hold a second station entry until the old one ages out, so the effective ceiling is lower than the number."
 }

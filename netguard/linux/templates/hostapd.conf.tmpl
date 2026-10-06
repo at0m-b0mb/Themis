@@ -31,8 +31,11 @@ rsn_pairwise=CCMP
 # This is the first line against answer-sharing; nftables backs it up.
 ap_isolate={{AP_ISOLATE}}
 
-# Headroom over the real class size. Refusing to associate is a visible failure,
-# which is better than silently degrading for everyone.
+# A per-BSS station limit, so with two radios it applies to each band on its own.
+# Set far above any plausible roster, because hitting it is NOT a visible failure:
+# hostapd replies "unable to handle additional associated stations" and the laptop
+# shows a generic "cannot connect", which looks exactly like a student who never
+# arrived -- including in the proctor console.
 max_num_sta={{MAX_STA}}
 
 # The SSID must be discoverable -- students have to find it.

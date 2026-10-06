@@ -70,9 +70,44 @@ class Context:
         self.policy = policy
         self.journal = Journal(journal_path)
         self.lock = threading.Lock()
-        self.ap_interface = policy.get("ap_interface") or policy.get("exam_interface")
+        # Two interfaces, two different jobs, and conflating them breaks both.
+        #
+        #   radio_interfaces -- the RADIOS, asked over hostapd_cli. With two of
+        #       them, asking only the first makes every student on the other band
+        #       read as absent for the whole exam.
+        #   student_interface -- the L3 interface students actually arrive on,
+        #       used for ARP. With two radios the exam address sits on the BRIDGE,
+        #       so filtering /proc/net/arp by a radio name yields nothing and no
+        #       registration can ever be corroborated.
+        #
+        # `hostapd_cli -i br-themis` does not work and `arp filtered by wlan0`
+        # finds nothing, so neither name can stand in for the other.
+        raw = policy.get("radios") or [{"interface": policy.get("ap_interface")
+                                        or policy.get("exam_interface")}]
+        self.radio_interfaces = [str(r["interface"]) for r in raw if r.get("interface")]
+        self.ap_interface = self.radio_interfaces[0] if self.radio_interfaces else None
+        self.student_interface = self._student_interface(policy)
         self.lease_file = Path(policy.get("lease_file", "/run/themis/dhcp.leases"))
         self._recent: dict[str, float] = {}   # ip -> last registration attempt
+
+    @staticmethod
+    def _student_interface(policy: dict) -> str | None:
+        """Where students arrive at layer 3: the bridge, or the single radio.
+
+        Preferring what is actually RUNNING (state.json, written by themis-ap at
+        `up`) over what the policy currently says, because the policy can be
+        edited mid-exam and the ARP table belongs to the network that is up.
+        """
+        try:
+            st = json.loads(Path("/run/themis/state.json").read_text())
+            iface = st.get("ap_interface")
+            if iface:
+                return str(iface)
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+        if policy.get("radios"):
+            return str(policy.get("bridge") or "br-themis")
+        return policy.get("ap_interface") or policy.get("exam_interface")
 
     def registered_ids(self) -> dict[str, dict]:
         return {e.data.get("student_id"): e.data
@@ -105,12 +140,28 @@ class Context:
         network. So the source travels with the sample, and the console says plainly
         when it is no longer hearing from the radio.
         """
-        if self.ap_interface:
-            sta = hostapd_stations(self.ap_interface)
-            if sta is not None:
-                return sta, "hostapd"
+        answered: set[str] = set()
+        asked = silent = 0
+        for iface in self.radio_interfaces:
+            asked += 1
+            sta = hostapd_stations(iface)
+            if sta is None:
+                silent += 1
+            else:
+                answered |= sta
+
         now = time.time()
         leases = {l.mac for l in read_leases(self.lease_file) if not l.expired(now)}
+
+        if asked and silent == 0:
+            return answered, "hostapd"
+        if asked and silent < asked:
+            # One radio answered and another did not. Reporting just the union of
+            # the radios that replied would read as every student on the silent
+            # band leaving at the same instant -- the precise fiction this method
+            # exists to avoid -- so the leases stand in for the band we cannot ask,
+            # and the sample says it is partial.
+            return answered | leases, "hostapd_partial"
         return leases, "leases"
 
 
@@ -152,7 +203,7 @@ class StudentHandler(BaseHTTPRequestHandler):
     def _resolve(self):
         return resolve(self.client_ip,
                        lease_file=self.ctx.lease_file,
-                       interface=self.ctx.ap_interface)
+                       interface=self.ctx.student_interface)
 
     # -- routes ------------------------------------------------------------ #
 

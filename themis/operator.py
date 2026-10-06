@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -90,16 +91,49 @@ class Controller:
             return {}
 
     def ap_running(self) -> bool:
-        pf = RUN_DIR / "hostapd.pid"
-        if not pf.exists():
+        """Is ANY hostapd we started still alive?
+
+        Globbed, not a single filename. With two radios themis-ap writes
+        hostapd-<iface>.pid and never hostapd.pid, so looking only for the latter
+        reported a running dual-band exam as stopped -- which left "Start the
+        exam" enabled for the whole sitting, and that button archives the live
+        record as its first action.
+        """
+        if not RUN_DIR.is_dir():
             return False
-        try:
-            return _pid_alive(int(pf.read_text().strip()))
-        except (ValueError, OSError):
-            return False
+        for pf in list(RUN_DIR.glob("hostapd.pid")) + list(RUN_DIR.glob("hostapd-*.pid")):
+            try:
+                if _pid_alive(int(pf.read_text().strip())):
+                    return True
+            except (ValueError, OSError):
+                continue
+        return False
 
     def portal_running(self) -> bool:
-        return self.portal is not None and self.portal.poll() is None
+        """Is a portal serving students -- ANY portal, not just ours?
+
+        `self.portal` only knows about a process THIS Controller spawned, so it
+        is False after the panel is restarted (which operator.py tells the
+        operator is safe) and False for a portal started from a shell (which this
+        module's own docstring documents as the equivalent command). Both cases
+        made a live exam look stopped.
+        """
+        if self.portal is not None and self.portal.poll() is None:
+            return True
+        pf = RUN_DIR / "portal.pid"
+        try:
+            if pf.exists() and _pid_alive(int(pf.read_text().strip())):
+                return True
+        except (ValueError, OSError):
+            pass
+        # Last resort: something is answering on the student port. Cheap, and it
+        # catches a portal nobody recorded a pid for.
+        try:
+            with socket.socket() as probe:
+                probe.settimeout(0.3)
+                return probe.connect_ex(("127.0.0.1", PORTAL_PORT)) == 0
+        except OSError:
+            return False
 
     def interfaces(self) -> list[dict]:
         out = []
@@ -361,9 +395,27 @@ class Controller:
 
     def start_exam(self) -> tuple[bool, str]:
         ensure_dirs()
-        # A new sitting starts on a clean chain. Appending onto the previous exam
-        # would make one chain spanning two of them, so a question about either
-        # could not be answered without handing over the other one's record.
+        # REFUSE if anything is already running. This is a server-side check on
+        # purpose: the greyed-out button in the panel is a hint, not a guard --
+        # dispatch() accepts {"action": "start_exam"} in any state, and the
+        # button was wrongly enabled for entire dual-band exams because
+        # ap_running() could not see hostapd-<iface>.pid.
+        #
+        # The first thing this method does is archive the journal. Doing that
+        # while a portal is appending to it renames the file out from under the
+        # writer, which then starts a FRESH chain at seq 0 -- so every student
+        # already registered disappears from the console, verify() cheerfully
+        # reports the new two-event chain as intact, and nothing anywhere says
+        # a record was lost.
+        if self.ap_running() or self.portal_running():
+            return False, (
+                "something is already running (AP="
+                f"{'yes' if self.ap_running() else 'no'}, portal="
+                f"{'yes' if self.portal_running() else 'no'}).\n\n"
+                "Press 'Stop the exam' first. The exam record was NOT touched -- "
+                "starting a new sitting archives it, and archiving it while a "
+                "portal is still writing would take every registration so far "
+                "out of the console without saying so.")
         archived = archive_previous(JOURNAL)
         pre = f"archived the previous exam record to {archived}\n" if archived else ""
         ok, txt = self.ap_up()

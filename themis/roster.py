@@ -150,6 +150,13 @@ def build_roster(
     for ev in events:
         if ev.kind == "exam_open":
             r.opened_at = ev.ts
+            # Clear the PREVIOUS sitting's close. Left set, it points at an
+            # instant already in the past, and every still-open gap is then
+            # measured against it and clamps to zero -- so a student who has
+            # been gone twenty minutes is reported to the proctor as "gone 0s".
+            # Reached whenever the portal is restarted, which server.py's own
+            # docstring documents as a normal thing to do.
+            r.closed_at = None
         elif ev.kind == "exam_close":
             r.closed_at = ev.ts
         elif ev.kind == "register":
