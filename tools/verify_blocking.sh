@@ -62,13 +62,42 @@ faster_than() { awk -v x="${1:-99}" -v m="${2:-0}" 'BEGIN{exit !(x+0<m+0)}'; }
 # internet and every UDP-based VPN works. If nothing comes back, nothing left.
 UDP_PROBE_RAW=""
 udp_reaches_internet() {
-  # Captured rather than piped straight into grep, so that a claimed bypass can
-  # be inspected instead of taken on trust. `dig +short` writes its errors to
-  # STDOUT, so the raw text is the only way to tell a real answer from a
-  # timeout message that merely contains digits and dots.
-  UDP_PROBE_RAW=$(s1 timeout 8 dig +short +time=4 +tries=1 example.com @8.8.8.8 2>&1)
-  printf '%s\n' "$UDP_PROBE_RAW" \
-    | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+  # The probe is NTP, not DNS, and that is load-bearing.
+  #
+  # Port 53 is redirected to our own resolver on purpose, so that a laptop with
+  # a pinned public resolver still reaches the captive portal instead of
+  # silently resolving nothing. That redirect means a DNS query aimed at
+  # 8.8.8.8 is ANSWERED -- by us -- so it can no longer tell you whether a
+  # packet left the network. Using it anyway would report a VPN hole on a
+  # correctly sealed network.
+  #
+  # NTP is not redirected, and a public NTP server replies, so a reply is proof
+  # a UDP datagram reached the internet and came back. No reply means nothing
+  # left -- which is the same thing WireGuard, OpenVPN/UDP and IKEv2 need.
+  UDP_PROBE_RAW=$(s1 timeout 8 python3 - <<'PY' 2>&1
+import socket, struct, sys, time
+# A minimal NTPv3 client request: LI=0, VN=3, Mode=3 in the first byte.
+pkt = b'\x1b' + 47 * b'\0'
+for host in ("pool.ntp.org", "time.cloudflare.com", "216.239.35.0"):
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(2.5)
+        sock.sendto(pkt, (host, 123))
+        data, _ = sock.recvfrom(256)
+        sock.close()
+        if len(data) >= 48:
+            secs = struct.unpack("!I", data[40:44])[0]
+            # A plausible timestamp proves this is a real NTP reply and not noise.
+            if secs > 3_000_000_000:
+                print("REPLY from %s t=%d" % (host, secs))
+                sys.exit(0)
+    except Exception as e:
+        print("no reply from %s (%s)" % (host, type(e).__name__))
+print("NO-UDP-EGRESS")
+sys.exit(1)
+PY
+)
+  printf '%s\n' "$UDP_PROBE_RAW" | grep -q '^REPLY '
 }
 
 # Independent of any reply: the kernel counts packets it refused to route.
@@ -159,12 +188,18 @@ fi
 # when the query had been blocked, and would have reported success only if the
 # resolver really were reachable. Anchoring to a complete dotted quad is what
 # makes the test mean what it says.
-if udp_reaches_internet; then
-  bad "DNS to 8.8.8.8 ANSWERED -- the resolver can be bypassed" \
-      "dig returned: $(printf '%s' "$UDP_PROBE_RAW" | tr '\n' '|')"
+# Port 53 aimed at a public resolver is REDIRECTED to ours, not refused: a
+# student whose laptop pins 8.8.8.8 must still reach the portal rather than
+# resolve nothing and conclude the network is broken. The property to check is
+# therefore that it comes back with OUR sinkhole answer and never the real one.
+ext=$(s1 timeout 6 dig +short +time=3 +tries=1 example.com @8.8.8.8 2>/dev/null | head -1)
+if [ "$ext" = "$SRV" ]; then
+  ok "a query aimed at 8.8.8.8 is answered by our resolver, not theirs (-> $ext)"
+elif [ -z "$ext" ]; then
+  ok "a query aimed at 8.8.8.8 gets nothing back"
 else
-  ok "DNS to an outside resolver is refused"
-  printf "        (dig said: %s)\n" "$(printf '%s' "$UDP_PROBE_RAW" | tr '\n' '|' | cut -c1-90)"
+  bad "8.8.8.8 returned a REAL answer ($ext)" \
+      "the resolver can be bypassed, so DNS tunnelling is available"
 fi
 t=$(timed s1 timeout 3 bash -c "exec 3<>/dev/tcp/1.1.1.1/853")
 if s1 timeout 3 bash -c "exec 3<>/dev/tcp/1.1.1.1/853" 2>/dev/null; then

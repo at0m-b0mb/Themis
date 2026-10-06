@@ -38,7 +38,11 @@
     "aadcdn.msftauth.net",
     "logincdn.msauth.net",
     "aadcdn.msauthimages.net",
-    "aadcdn.msftauthimages.net"
+    "aadcdn.msftauthimages.net",
+    "sso.canvaslms.com",
+    "du11hjcvx0uqb.cloudfront.net",
+    "instructure-uploads.s3.amazonaws.com",
+    "inst-fs-iad-prod.inscloudgate.net"
   ],
   "allow_egress": [],
   "enterprise": {

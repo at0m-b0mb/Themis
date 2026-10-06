@@ -698,6 +698,18 @@ def render(pol: dict) -> dict[str, str]:
             "    # on the proxy, which is the only thing that decides where it may go.",
             f'    iifname "{ap_if}" tcp dport 443 ip daddr != {srv} dnat to {srv}',
         ]
+    redirect += [
+        "",
+        "    # DNS as well. A laptop with its resolver pinned to a public address --",
+        "    # a managed device, or a student who set 8.8.8.8 once and forgot --",
+        "    # ignores the DHCP dns-server entirely. Those queries are forward-path",
+        "    # packets that the input chain's reject never sees, so they die at",
+        "    # ip_forward=0: the student resolves nothing, sees no portal, and",
+        "    # concludes the exam network is broken. Sent here, they get the same",
+        "    # sinkhole answer as everyone else.",
+        f'    iifname "{ap_if}" udp dport 53 ip daddr != {srv} dnat to {srv}',
+        f'    iifname "{ap_if}" tcp dport 53 ip daddr != {srv} dnat to {srv}',
+    ]
     if prof in ("airgap", "proxy"):
         redirect += [
             "",
@@ -709,10 +721,14 @@ def render(pol: dict) -> dict[str, str]:
             "    # the failure this project keeps choosing to avoid. Sent here, the packet",
             "    # meets the input chain's `reject with tcp reset` and dies in milliseconds.",
             "    #",
-            "    # TCP only, deliberately. Redirecting UDP as well would hand every query",
-            "    # aimed at a public resolver to our own dnsmasq, which would answer it --",
-            "    # turning \"DNS to 8.8.8.8\" from refused into answered-by-the-sinkhole and",
-            "    # quietly destroying the one probe that can prove UDP egress is shut.",
+            "    # TCP only. UDP port 53 is redirected separately above, because a",
+            "    # student with a pinned resolver must still reach the portal -- but",
+            "    # nothing else in UDP is, and that is deliberate: a blanket UDP",
+            "    # redirect would make every probe aimed at a public service answer",
+            "    # locally, and the question of whether a UDP packet ever left",
+            "    # this network would stop being answerable at all.",
+            "    # being answerable at all. tools/verify_blocking.sh therefore probes",
+            "    # egress over NTP (udp/123), which is NOT redirected here.",
             f'    iifname "{ap_if}" meta l4proto tcp ip daddr != {srv} dnat to {srv}',
         ]
 
@@ -1586,9 +1602,49 @@ def _wait_for_beacon(iface: str, hp, logp: Path, label: str) -> str | None:
     return None
 
 
+def _live_pids() -> list[tuple[str, int]]:
+    """(name, pid) for everything we started that is still alive."""
+    out_ = []
+    if not RUN_DIR.is_dir():
+        return out_
+    for pf in sorted(RUN_DIR.glob("*.pid")):
+        try:
+            pid = int(pf.read_text().strip())
+            os.kill(pid, 0)
+        except PermissionError:
+            out_.append((pf.stem, pid))          # alive, just not ours to signal
+        except (ValueError, OSError):
+            continue
+        else:
+            out_.append((pf.stem, pid))
+    return out_
+
+
 def cmd_up(pol: dict) -> int:
     if os.geteuid() != 0:
         die("`up` must run as root: sudo netguard/linux/bin/themis-ap up")
+
+    # Refuse a second `up`. Two separate things go wrong otherwise, and both are
+    # silent:
+    #   * the health checks pass on the PREVIOUS run's artifacts -- the control
+    #     socket is already there and the log already contains AP-ENABLED -- so
+    #     the new hostapd can die instantly while `up` reports "exam AP is up"
+    #     and orphans the hostapd that actually holds the radio;
+    #   * nftables.saved is overwritten with the EXAM ruleset, so `down` later
+    #     restores a default-deny firewall as "the ruleset that was here before
+    #     the exam" and leaves the host with no working network.
+    live = _live_pids()
+    if live:
+        die("Themis is already up: " +
+            ", ".join(f"{n} (pid {p})" for n, p in live) + ".\n"
+            "        Run `down` first, then `up`. Starting twice makes the health\n"
+            "        checks pass on the previous run's control socket and log, so\n"
+            "        this would report success while the new hostapd was already\n"
+            "        dead -- and it would overwrite the saved pre-exam firewall\n"
+            "        with the exam's own.")
+    if STATE.exists():
+        print(f"note: {STATE} is left over from a run whose processes are all gone.\n"
+              f"      Treating this as a fresh start and replacing it.\n")
     fails, warns, oks = _collect(pol)
     _report(pol["profile"], fails, warns, oks)
     if fails:
@@ -1806,12 +1862,33 @@ def cmd_down(pol: dict) -> int:
     return 0
 
 
+def _pidfile_alive(pidf: Path) -> bool:
+    """Is the process this pid file names ACTUALLY running?
+
+    A pid file outlives the process that wrote it. Reporting "running" from the
+    file's mere existence means a radio that crashed mid-exam still reads as up,
+    and the operator sees every student drop off at once with nothing explaining
+    why -- the single most misleading thing this status screen could say.
+    """
+    try:
+        pid = int(pidf.read_text().strip())
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True                               # alive, owned by someone else
+    except OSError:
+        return False
+    return True
+
+
 def cmd_status(pol: dict) -> int:
     prof = pol["profile"]
     radios = radios_of(pol)
     multi = len(radios) > 1
     bridge = bridge_of(pol)
-    dns_up = (RUN_DIR / "dnsmasq.pid").exists()
+    dns_up = _pidfile_alive(RUN_DIR / "dnsmasq.pid")
 
     # Per radio, because "12 associated" tells an operator nothing about whether
     # the 2.4 GHz side ever came up. If one band is dead, the number that proves
@@ -1820,7 +1897,7 @@ def cmd_status(pol: dict) -> int:
     for r in radios:
         iface = r["interface"]
         pidf = RUN_DIR / (f"hostapd-{iface}.pid" if multi else "hostapd.pid")
-        running = pidf.exists()
+        running = _pidfile_alive(pidf)
         found = []
         if running and shutil.which("hostapd_cli"):
             for line in out(["hostapd_cli", "-i", iface, "list_sta"]).splitlines():

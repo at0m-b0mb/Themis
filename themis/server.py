@@ -166,6 +166,13 @@ class Context:
 
 
 class StudentHandler(BaseHTTPRequestHandler):
+    # A read deadline. Without it a client that opens a connection and sends
+    # nothing holds its thread forever, and the proctor console runs in THIS
+    # process -- so enough half-open connections from one laptop take the
+    # console down along with the exam page. BaseHTTPRequestHandler wraps
+    # handle_one_request in `except TimeoutError`, so this costs nothing on the
+    # exam path and simply closes a connection that has stopped talking.
+    timeout = 10
     server_version = "Themis"
     sys_version = ""
     ctx: Context = None  # set by serve()
@@ -282,6 +289,7 @@ class StudentHandler(BaseHTTPRequestHandler):
 
 
 class ConsoleHandler(BaseHTTPRequestHandler):
+    timeout = 10
     """The proctor's view. Loopback-only, and nftables does not permit the port
     either -- two independent reasons, because this lists every student's name and
     device."""
@@ -446,7 +454,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         for sid in sorted(roster.registrations):
             reg = roster.registrations[sid]
             p = roster.presence.get(sid)
-            w(f"{reg.name}  ({sid})" + (f"  seat {reg.seat}" if reg.seat else ""))
+            w(f"{_flat(reg.name, 80)}  ({sid})"
+              + (f"  seat {_flat(reg.seat, 24)}" if reg.seat else ""))
             w(f"    device        {reg.mac}  [{reg.resolution_source}]")
             w(f"    signed in     {time.strftime('%H:%M:%S', time.localtime(reg.at))}")
             if len(earlier.get(sid, [])) > 1:
@@ -480,15 +489,40 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         return "\n".join(L) + "\n"
 
 
+def _flat(value, limit: int) -> str:
+    """One line, bounded, for the plain-text record.
+
+    The student types their own name, and this file is the authoritative record
+    a human reads when deciding what a gap meant. A name containing a newline
+    does not look like a bad name here -- it looks like ANOTHER STUDENT'S ENTRY,
+    complete with an id and a seat, forged by the student being reviewed. The
+    hash chain cannot help: the forged text was faithfully journalled, so the
+    chain verifies as perfectly intact over it.
+    //
+    Flattening at the RENDERER is what makes this safe retroactively. Events
+    already written cannot be edited without breaking the chain, so any name
+    journalled before this fix stays tainted forever and only the thing that
+    prints it can neutralise it.
+    """
+    return " ".join(str(value).split())[:limit]
+
+
 def presence_loop(ctx: Context, interval: float, stop: threading.Event):
     while not stop.wait(interval):
+        # The append belongs INSIDE the guard. Outside it, a single transient
+        # journal write error -- a full disk, a momentary EIO -- raises out of
+        # the loop and ends presence sampling for the rest of the exam, while
+        # the console carries on showing the last sample and saying "live".
+        # Silence is the one failure mode this record must never have.
         try:
             macs, source = ctx.observe_macs()
-        except Exception:
-            continue  # a sampling failure must never take the portal down
-        with ctx.lock:
-            ctx.journal.append("presence_sample",
-                               {"macs": sorted(macs), "source": source})
+            with ctx.lock:
+                ctx.journal.append("presence_sample",
+                                   {"macs": sorted(macs), "source": source})
+        except Exception as e:                       # noqa: BLE001
+            print(f"themis: presence sample failed ({e!r}); still sampling",
+                  file=sys.stderr, flush=True)
+            continue
 
 
 def review(policy: dict, *, journal_path: Path, console_port: int) -> int:
