@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32"
+     role="img" aria-label="Themis">
+  <title>Themis</title>
+  <!-- A separate, heavier drawing rather than the full mark scaled down. At
+       16px the plinth steps, the finial and the cords collapse into noise: the
+       detail that makes the mark read at 128px is exactly what destroys it at
+       16px. So this keeps only what survives — a level beam, a post, a foot and
+       two pans — at roughly double the relative stroke weight. -->
+  <g fill="none" stroke="var(--themis-mark, #9A7B28)" stroke-width="2.6"
+     stroke-linecap="round" stroke-linejoin="round">
+    <path d="M5 11 H27"/>
+    <path d="M16 11 V23"/>
+    <path d="M10 25.5 H22"/>
+    <path d="M5 11 V14"/>
+    <path d="M1.8 14 Q5 19 8.2 14"/>
+    <path d="M27 11 V14"/>
+    <path d="M23.8 14 Q27 19 30.2 14"/>
+  </g>
+</svg>

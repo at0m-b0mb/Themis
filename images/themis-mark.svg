@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 64" width="72" height="64"
+     role="img" aria-label="Themis: a balance at rest">
+  <title>Themis</title>
+  <desc>A balance whose beam is exactly level. Themis is the goddess of fair
+  judgement; the beam is level because the claim this project makes is an
+  unweighted one — it states what it can prove and, just as plainly, what it
+  cannot. The pans are empty: nothing has been decided yet.</desc>
+  <!-- Colour comes from a CSS custom property with a brass fallback, so ONE file
+       serves both uses: dropped into an img element the variable is undefined
+       and the fallback applies, while inlined in a page that defines the
+       property it takes the surrounding theme. currentColor alone cannot do
+       this, because an external SVG in an img element is its own document and
+       inherits nothing from the page, so it would render black.
+       (Note for editors: a double hyphen may not appear inside an XML comment.
+       Writing the property name here with its leading hyphens made this file
+       unparseable, and it rendered as a broken image everywhere.) -->
+  <g fill="none" stroke="var(--themis-mark, #9A7B28)" stroke-width="3.4"
+     stroke-linecap="round" stroke-linejoin="round">
+    <!-- The beam, dead level. -->
+    <path d="M10 20 H62"/>
+    <!-- The post, with a finial above the beam. -->
+    <path d="M36 20 V45"/>
+    <path d="M36 15.5 V20"/>
+    <!-- The plinth: two steps and a taper. Classical, not ornamental. -->
+    <path d="M28 45 H44"/>
+    <path d="M22 52 H50"/>
+    <path d="M30.5 45 L27 52 M41.5 45 L45 52"/>
+    <!-- The pans, hanging by their cords and holding nothing. -->
+    <path d="M10 20 V26.5"/>
+    <path d="M1.6 26.5 Q10 35.5 18.4 26.5"/>
+    <path d="M62 20 V26.5"/>
+    <path d="M53.6 26.5 Q62 35.5 70.4 26.5"/>
+  </g>
+  <circle cx="36" cy="13" r="2.7" fill="var(--themis-mark, #9A7B28)"/>
+</svg>

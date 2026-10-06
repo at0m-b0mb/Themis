@@ -20,6 +20,32 @@ def esc(v) -> str:
 
 
 # Warm white and gold, light by default, true black in dark mode -- no navy.
+# --- brand -------------------------------------------------------------------
+# The favicon is inlined as a data URI rather than linked. These servers serve
+# HTML and nothing else, so `<link rel="icon" href="/favicon.svg">` would 404
+# unless a route existed purely to feed it -- and a 404 favicon is how a tab ends
+# up showing the browser's generic page icon on a proctor's screen.
+FAVICON = "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2032%2032%22%20width%3D%2232%22%20height%3D%2232%22%20role%3D%22img%22%20aria-label%3D%22Themis%22%3E%20%3Ctitle%3EThemis%3C%2Ftitle%3E%20%3Cg%20fill%3D%22none%22%20stroke%3D%22%239A7B28%22%20stroke-width%3D%222.6%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%20%3Cpath%20d%3D%22M5%2011%20H27%22%2F%3E%20%3Cpath%20d%3D%22M16%2011%20V23%22%2F%3E%20%3Cpath%20d%3D%22M10%2025.5%20H22%22%2F%3E%20%3Cpath%20d%3D%22M5%2011%20V14%22%2F%3E%20%3Cpath%20d%3D%22M1.8%2014%20Q5%2019%208.2%2014%22%2F%3E%20%3Cpath%20d%3D%22M27%2011%20V14%22%2F%3E%20%3Cpath%20d%3D%22M23.8%2014%20Q27%2019%2030.2%2014%22%2F%3E%20%3C%2Fg%3E%20%3C%2Fsvg%3E"
+
+# The mark, inlined so it inherits the page's own colours. An <img> could not:
+# an external SVG is its own document, it sees the VIEWER's colour scheme rather
+# than the page's background, and these pages let the operator override the theme
+# -- so a dark-mode viewer on a light-themed console would get an invisible mark.
+MARK_SVG = """<svg class="mark" viewBox="0 0 72 64" aria-hidden="true" focusable="false">
+<g fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round">
+<path d="M10 20 H62"/><path d="M36 20 V45"/><path d="M36 15.5 V20"/>
+<path d="M28 45 H44"/><path d="M22 52 H50"/><path d="M30.5 45 L27 52 M41.5 45 L45 52"/>
+<path d="M10 20 V26.5"/><path d="M1.6 26.5 Q10 35.5 18.4 26.5"/>
+<path d="M62 20 V26.5"/><path d="M53.6 26.5 Q62 35.5 70.4 26.5"/>
+</g><circle cx="36" cy="13" r="2.7" fill="currentColor"/></svg>"""
+
+BRAND_CSS = """
+.brand{display:flex; align-items:center; gap:.65rem; margin:0 0 .35rem}
+.brand .mark{width:34px; height:30px; flex:none; color:var(--gold)}
+.brand .nm{font-family:ui-serif,Georgia,"Times New Roman",serif; font-size:1.02rem;
+  font-weight:600; letter-spacing:.14em; color:var(--ink)}
+"""
+
 CSS = """
 :root{
   --bg:#fbfaf7; --panel:#fffefb; --ink:#1a1814; --muted:#6d675d;
@@ -97,6 +123,7 @@ def page(title: str, body: str, *, wide: bool = False) -> str:
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="{FAVICON}">
 <title>{esc(title)}</title>
 <style>{CSS}</style>
 </head><body><div class="wrap{' wide' if wide else ''}">{body}</div></body></html>"""
@@ -421,12 +448,14 @@ def console_page(*, policy: dict) -> str:
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="{FAVICON}">
 <title>Themis — proctor console</title>
-<style>{CSS}{CONSOLE_CSS}</style>
+<style>{CSS}{CONSOLE_CSS}{BRAND_CSS}</style>
 </head><body><div class="wrap wide">
 
 <div class="bar">
-  <h1>Proctor console</h1>
+  <div class="brand">{MARK_SVG}<span class="nm">THEMIS</span></div>
+<h1>Proctor console</h1>
   <span class="live"><span class="dot beat" id="beat"></span><span id="livetext">live</span></span>
   <span class="live" style="margin-left:auto">elapsed <span id="clock" class="mono">—</span></span>
 </div>
@@ -785,10 +814,12 @@ def operator_page() -> str:
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="{FAVICON}">
 <title>Themis — set up the exam</title>
-<style>{CSS}{OPERATOR_CSS}</style>
+<style>{CSS}{OPERATOR_CSS}{BRAND_CSS}</style>
 </head><body><div class="wrap">
 
+<div class="brand">{MARK_SVG}<span class="nm">THEMIS</span></div>
 <h1>Set up the exam</h1>
 <p class="sub">Nothing to type, and nothing here looks at a student's machine.</p>
 

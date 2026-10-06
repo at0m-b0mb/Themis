@@ -37,8 +37,9 @@ pre code{background:none;padding:0;font-size:inherit}
 header.top{border-bottom:1px solid var(--rule);background:var(--sunken)}
 header.top .wrap{display:flex;align-items:center;gap:13px;padding:13px 24px}
 .mk{width:34px;height:34px;border-radius:8px;background:var(--brass);flex:none}
-.mk svg{display:block;width:34px;height:34px}
+.mk svg{display:block;width:34px;height:34px;color:var(--paper)}
 .wordmark{font-family:var(--serif);font-size:19px;font-weight:600;letter-spacing:.06em}
+
 .kind{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--faint)}
 header.top nav{margin-left:auto;display:flex;gap:16px;align-items:center;font-size:14px}
 button.theme{background:none;border:1px solid var(--rule-strong);color:var(--muted);
@@ -77,16 +78,41 @@ border-radius:999px;padding:6px 14px;font-size:13.5px;background:var(--surface)}
 footer{border-top:1px solid var(--rule);margin-top:30px;padding:28px 0 54px;
 color:var(--faint);font-size:13px;text-align:center}
 footer a{color:var(--faint)}
+.claim{border-left:3px solid var(--brass);padding:4px 0 4px 22px;margin:26px 0;
+font-family:var(--serif);font-size:20px;line-height:1.5;color:var(--ink)}
+table.t{width:100%;border-collapse:collapse;font-size:15px;margin-top:6px}
+table.t th{text-align:left;font-size:11.5px;letter-spacing:.13em;text-transform:uppercase;
+color:var(--faint);font-weight:600;padding:0 12px 9px 0;border-bottom:1px solid var(--rule)}
+table.t td{padding:11px 12px 11px 0;border-bottom:1px solid var(--rule);
+vertical-align:top;color:var(--muted)}
+table.t td:first-child{color:var(--ink);white-space:nowrap}
+table.t td.v{font-family:var(--mono);font-size:12.5px;white-space:nowrap}
+.yes{color:#2F6B41}.no{color:#8C2F2F}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .yes{color:#6FBF87}
+:root:not([data-theme="light"]) .no{color:#E08585}}
+:root[data-theme="dark"] .yes{color:#6FBF87}:root[data-theme="dark"] .no{color:#E08585}
+.shot{width:100%;border:1px solid var(--rule);border-radius:10px;display:block;margin-top:8px}
+.cap{font-size:13.5px;color:var(--faint);margin-top:10px;text-align:center}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:6px}
+@media (max-width:680px){.grid2{grid-template-columns:1fr}}
+.card{border:1px solid var(--rule);border-radius:10px;padding:16px 18px;background:var(--surface)}
+.card h3{margin:0 0 6px;font-family:var(--serif);font-size:17px;font-weight:600}
+.card p{margin:0;font-size:14.5px;color:var(--muted);line-height:1.55}
 @media(max-width:560px){.hero{padding-top:44px}.kind{display:none}}
 </style>
 <meta property="og:image" content="https://raw.githubusercontent.com/at0m-b0mb/Themis/main/images/social-preview.png">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#F3F1EC" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#07070A" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="../images/favicon.svg" type="image/svg+xml">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:image" content="https://raw.githubusercontent.com/at0m-b0mb/Themis/main/images/social-preview.png">
 </head>
 <body>
 <header class="top">
   <div class="wrap">
-    <span class="mk"><svg viewBox='0 0 100 100' xmlns='http://www.w3.org/2000/svg' fill='none' stroke='#F3F1EC' stroke-width='6' stroke-linejoin='round' stroke-linecap='round'><style>.f{fill:#F3F1EC;stroke:none}</style><rect x='20' y='26' width='60' height='44' rx='8'/><path d='M37 42 l-8 8 l8 8'/><path d='M63 42 l8 8 l-8 8'/><rect x='46' y='56' width='18' height='5' class='f'/></svg></span>
+    <span class="mk" aria-hidden="true"><svg viewBox="-5 -7 82 78" xmlns="http://www.w3.org/2000/svg"><g fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M10 20 H62"/><path d="M36 20 V45"/><path d="M36 15.5 V20"/><path d="M28 45 H44"/><path d="M22 52 H50"/><path d="M30.5 45 L27 52 M41.5 45 L45 52"/><path d="M10 20 V26.5"/><path d="M1.6 26.5 Q10 35.5 18.4 26.5"/><path d="M62 20 V26.5"/><path d="M53.6 26.5 Q62 35.5 70.4 26.5"/></g><circle cx="36" cy="13" r="2.7" fill="currentColor"/></svg></span>
     <div>
       <div class="wordmark">Themis</div>
       <div class="kind">Python</div>
@@ -98,41 +124,141 @@ footer a{color:var(--faint)}
   </div>
 </header>
 <div class="wrap">
-  <div class="hero">
-    <h1>Exam integrity built on controls that actually hold.</h1>
-    <p class="lede">Exam integrity built on controls that actually hold — an air-gapped exam network, a captive-portal roster, and a hash-chained record. No student device is ever inspected.</p>
-    <div class="chips"><span>Python</span><span>Python</span><span>MIT</span><span>3 stars</span></div>
+
+  <section class="hero">
+    <h1>Exam integrity built on controls<br>that actually hold.</h1>
+    <p class="lede">An air-gapped exam network that filters by <strong>name</strong>, not by
+      address. No student device is ever inspected — and every limit is stated on the
+      face of the exam it delivers.</p>
+    <div class="chips">
+      <span>v0.2.0</span><span>193 tests</span><span>Python stdlib only</span><span>MIT</span>
+    </div>
     <div class="cta">
       <a class="primary" href="https://github.com/at0m-b0mb/Themis">View on GitHub</a>
-      <a class="ghost" href="https://github.com/at0m-b0mb/Themis/archive/refs/heads/main.zip">Download</a>
+      <a class="ghost" href="https://github.com/at0m-b0mb/Themis/blob/main/docs/THREAT_MODEL.md">Read the threat model</a>
     </div>
-  </div>
-  <section>
-    <h2>About</h2>
-    <p>Exam integrity for university courses, built on controls that actually hold — and honest about the ones that don't.</p>
   </section>
+
   <section>
-    <h2>What it does</h2>
-    <ul class="feat">
-      <li><strong><code>airgap</code></strong> — no uplink at all. Online lookup and cloud AI are not filtered,</li>
-      <li><strong><code>allowlist</code></strong> — a named set of domains resolves upstream. Needed if the quiz</li>
-      <li>[x] Exam network: air-gapped gateway, two profiles, assurance labelling</li>
-      <li>[x] Exam server + proctor console: live tiles, radio-reported presence,
-          per-student view of what the network was asked for</li>
-      <li>[ ] Per-student parameterised items QTI 1.2 export (imports into Canvas,</li>
-      <li>[ ] Per-student flags for practical/CTF questions</li>
-    </ul>
+    <h2>The design claim</h2>
+    <p>Commercial proctoring puts controls on the student's own machine, which is the one
+      place they cannot be enforced. A local AI model emits no packets. A phone in a lap is
+      off-machine entirely. An agent on an untrusted laptop can be killed, sandboxed, or fed
+      a fake answer. So the industry ships webcam gaze detection with documented racial bias,
+      flags disabled and neurodivergent students, and buys a signal that does not survive
+      contact with a determined cheater.</p>
+    <p class="claim">Themis moves every control onto hardware the institution owns, and
+      states its limits on the face of every exam it delivers.</p>
+    <p><strong>Design invariant: no Themis component inspects a student's device.</strong>
+      No process enumeration, no filesystem scanning, no camera, no microphone, no screen
+      capture, no keystroke biometrics. Not disabled by default — absent. A capability that
+      exists will be switched on by the first adopter who wants it.</p>
   </section>
+
   <section>
-    <h2>Getting started</h2>
-<pre><code>brew install dnsmasq
-sudo sysctl -w net.inet.ip.forwarding=0
-sudo netguard/bin/themis-net preflight    # is this machine fit to host an exam?
-sudo netguard/bin/themis-net render       # write the configs, change nothing
-sudo netguard/bin/themis-net up
-sudo netguard/bin/themis-net status       # what this setup can honestly claim
-sudo netguard/bin/themis-net down         # restore the previous network state</code></pre>
+    <h2>Filtering by name, not by address</h2>
+    <p>An address allowlist is not a control. A university's Canvas is four rotating CDN
+      addresses shared with every other tenant on that CDN — so pinning them goes stale
+      <em>and</em> lets a student reach those tenants by changing the TLS SNI.</p>
+    <p>Themis reads the SNI from the handshake, checks the <strong>name</strong>, then
+      resolves that name <strong>itself</strong>. The client never chooses the destination
+      address. Point the exam hostname at your own relay and you reach the exam site anyway.</p>
+    <p>It does not terminate TLS. No certificate, no decryption; the sockets are spliced
+      byte for byte and the browser validates the real server. And nothing is forwarded —
+      <code>ip_forward</code> stays <code>0</code> and the forward chain is empty, so the
+      proxy is the only process that egresses. That is why a self-hosted VPN on an arbitrary
+      address and port has nothing to reach.</p>
+    <div class="grid2">
+      <div class="card"><h3>Air-gapped</h3><p>No uplink at all. Online lookup, cloud AI, VPN
+        and Tor are not filtered — they are unreachable. The only mode that proves rather
+        than claims.</p></div>
+      <div class="card"><h3>Allowlist</h3><p>Only the named sites work; everything else is
+        refused in milliseconds, by name, so it survives the CDN rotating.</p></div>
+      <div class="card"><h3>Blocklist</h3><p>The web works except the named sites. Much
+        weaker — a site you did not think of is a site that works.</p></div>
+      <div class="card"><h3>Dual-band</h3><p>Two radios bridged under one SSID, 2.4 and
+        5&nbsp;GHz, so no device is excluded. Client isolation holds across both.</p></div>
+    </div>
   </section>
+
+  <section>
+    <h2>What the proctor sees</h2>
+    <p>Per student: whether their device is on the network, any gaps with timestamp
+      <em>bounds</em> rather than false precision, and what the network was asked for.</p>
+    <img class="shot" src="../images/social-preview.png" alt="The Themis proctor console showing three students, the sites their devices requested, and which were refused">
+    <p class="cap">A student working shows the exam site. A student reaching for an AI tool
+      shows dozens of refusals to one name.</p>
+    <p>That wording is exact, and the console uses it on screen. The proxy splices TLS
+      without terminating it, so a <strong>hostname is the most that can ever be known</strong>
+      — the page opened on an allowed site, what was typed into it and what came back are
+      invisible, and no future work here will change that. A tile showing the exam site means
+      the device requested it, not that the student is working; a refusal does not mean anyone
+      tried to cheat, because a phone reaches for iCloud on its own. These are questions worth
+      asking, never answers.</p>
+  </section>
+
+  <section>
+    <h2>What is honestly out of reach</h2>
+    <table class="t">
+      <thead><tr><th>Route</th><th>Verdict</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Online answer lookup</td><td class="v yes">blocked</td>
+            <td>Refused by name, so it does not go stale when the CDN rotates.</td></tr>
+        <tr><td>Cloud AI</td><td class="v yes">blocked</td>
+            <td>Their names are not allowlisted; there is no address to pin and none to miss.</td></tr>
+        <tr><td>Self-hosted VPN, any port</td><td class="v yes">blocked</td>
+            <td>No student packet is ever forwarded. The proxy connects to a name it resolved
+                itself, so an arbitrary address is unreachable even on 443.</td></tr>
+        <tr><td>VPN over TLS with a forged SNI</td><td class="v yes">blocked</td>
+            <td>The destination address the client chose is discarded.</td></tr>
+        <tr><td>DNS tunnelling</td><td class="v yes">impossible</td>
+            <td>The resolver has no upstream, so there is no exit.</td></tr>
+        <tr><td>Local AI on their laptop</td><td class="v no">not blocked</td>
+            <td>Runs offline and emits no traffic. Invisible to any network control.</td></tr>
+        <tr><td>Phone on cellular</td><td class="v no">not blocked</td>
+            <td>Never touches this network. Jamming it violates §333 of the Communications
+                Act — the FCC fined Marriott $600k and Hilton/MC&nbsp;Dean $750k.</td></tr>
+        <tr><td>Collusion inside an allowed site</td><td class="v no">not blocked</td>
+            <td>Carried inside a connection you deliberately permitted.</td></tr>
+        <tr><td>Leaving for another network</td><td class="v">detected</td>
+            <td>The radio reports the disassociation. Preventing it would be illegal.</td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:18px">Those last four are handled by a human in the room and by
+      <strong>oral spot-checks</strong> — five minutes per student, which at a class of 28 is
+      about 2.5 hours and zero engineering. A student who cannot explain their own answer is
+      caught by the only control that scales against a tool able to write any answer.</p>
+  </section>
+
+  <section>
+    <h2>Run it</h2>
+    <pre><code>git clone https://github.com/at0m-b0mb/Themis.git &amp;&amp; cd Themis
+sudo apt install -y hostapd dnsmasq nftables iw rfkill
+
+python3 -m unittest discover -s tests        # 193 tests, no hardware needed
+sudo netguard/linux/bin/themis-ap autoconfigure   # detect adapters, assign bands
+sudo bash tools/exam-up.sh                   # radios, DHCP, DNS, firewall, proxy, portal
+sudo bash tools/verify_blocking.sh           # prove it refuses what you think it does</code></pre>
+    <p style="margin-top:14px">Or <code>sudo python3 -m themis.operator</code> for a panel on
+      <code>127.0.0.1:8080</code> that does all of it with buttons — including a
+      <strong>Refused so far</strong> table that turns real traffic into the allowlist.</p>
+  </section>
+
+  <section>
+    <h2>Status</h2>
+    <div class="notice">
+      <strong>v0.2.0 — proven end to end on real hardware, not yet proven at class scale.</strong>
+      Both halves of that matter.<br><br>
+      <strong>Run:</strong> two adapters bridged under one SSID on both bands; a complete
+      university SSO login through Shibboleth, Entra and a FIDO passkey bridge; a forbidden
+      SNI refused even when aimed at the exam site's own IP address; Tailscale, Perplexity,
+      ChatGPT, Claude and Grammarly all refused on genuine device traffic.<br><br>
+      <strong>Not run:</strong> 28 laptops at once, a real submission at the moment a student
+      hits submit, and coverage from the back of the actual room. None of those can be
+      inferred from a bench test — do the dress rehearsal before it counts for marks.
+    </div>
+  </section>
+
   <div class="family">
     <h2>More from this catalogue</h2>
     <div class="row">

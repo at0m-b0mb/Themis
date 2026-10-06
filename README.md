@@ -1,7 +1,20 @@
-# Themis
+<p align="center">
+  <img src="images/themis-wordmark.svg" alt="Themis" width="420">
+</p>
 
-Exam integrity for university courses, built on controls that actually hold —
-and honest about the ones that don't.
+<p align="center">
+  <em>Exam integrity for university courses, built on controls that actually hold —<br>
+  and honest about the ones that don't.</em>
+</p>
+
+<p align="center">
+  <a href="https://github.com/at0m-b0mb/Themis/releases"><img alt="version" src="https://img.shields.io/badge/version-0.2.0-9A7B28?style=flat-square"></a>
+  <img alt="tests" src="https://img.shields.io/badge/tests-193%20passing-2F6B41?style=flat-square">
+  <img alt="dependencies" src="https://img.shields.io/badge/dependencies-stdlib%20only-6B6554?style=flat-square">
+  <a href="LICENSE"><img alt="licence" src="https://img.shields.io/badge/licence-MIT-6B6554?style=flat-square"></a>
+</p>
+
+---
 
 Named for the goddess of fair judgement. Fairness runs both directions here: a
 student is entitled to an exam that isn't rigged, and to not be surveilled to
