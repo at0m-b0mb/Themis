@@ -1,0 +1,846 @@
+#!/usr/bin/env python3
+"""exam -- one command that makes this host fit to run an exam, then runs it.
+
+    sudo ./exam                 start the exam (repairing whatever is in the way)
+    sudo ./exam doctor          find and fix the problems, start nothing
+    sudo ./exam doctor --dry-run   find them, change nothing, say what it would do
+    sudo ./exam stop            stop the exam and hand the host back
+    sudo ./exam status          what is running
+    sudo ./exam panel           open the operator panel instead
+
+Why this exists
+---------------
+Every single thing this repairs has already stopped an exam from starting, and
+none of them announced themselves. A fresh boot puts the regulatory domain back
+to '00', under which no 5 GHz access point may legally beacon -- and hostapd
+reports that as a bare nl80211 error with students already in the room.
+NetworkManager quietly reclaims a radio and tears the AP down underneath
+hostapd. wpa_supplicant holds the same radio for its own purposes. A previous
+run leaves a pid file whose process is gone, and the health checks then pass on
+the corpse. A portal started in a terminal dies when that terminal closes.
+
+Each one has a known fix that an operator should not have to remember at
+08:55 on exam morning. So this finds them, fixes them, says plainly what it
+changed, and only then starts anything.
+
+How it is built
+---------------
+It shells out to the SAME programs you would run by hand -- netguard/linux/bin/
+themis-ap and `python3 -m themis.server` -- rather than reimplementing them.
+There is one implementation of "bring up the exam network", so this and the
+terminal can never disagree, and everything you learn here still applies if you
+drop to a shell.
+
+Nothing here inspects a student's device. It repairs the host the institution
+owns, which is the whole argument of this project.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable
+
+ROOT = Path(__file__).resolve().parent
+THEMIS_AP = ROOT / "netguard" / "linux" / "bin" / "themis-ap"
+POLICY = ROOT / "netguard" / "linux" / "policy.json"
+TEMPLATES = ROOT / "netguard" / "linux" / "templates"
+RUN_DIR = Path("/run/themis")
+DATA_DIR = Path("/var/lib/themis")
+PORTAL_PID = RUN_DIR / "portal.pid"
+REGDOM_CONF = Path("/etc/modprobe.d/themis-regdom.conf")
+CONSOLE_PORT = 8081
+
+C_OK, C_WARN, C_BAD, C_DIM, C_B, C_0 = (
+    "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[1m", "\033[0m")
+if not sys.stdout.isatty():
+    C_OK = C_WARN = C_BAD = C_DIM = C_B = C_0 = ""
+
+
+# --------------------------------------------------------------------------- #
+# helpers
+
+def run(cmd, timeout=60) -> tuple[int, str]:
+    """Run a command, surviving a missing binary.
+
+    A diagnostic that raises when a tool is absent fails at exactly the job it
+    exists to do, so a missing program is a 127 like any other failure.
+    """
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except (OSError, subprocess.SubprocessError) as e:
+        return 127, str(e)
+
+
+def out(cmd, timeout=30) -> str:
+    return run(cmd, timeout)[1]
+
+
+def processes(match: Callable[[list[str]], bool]) -> list[tuple[int, str]]:
+    """Every process whose argv satisfies `match`, excluding this one.
+
+    Deliberately NOT `pgrep -f`. That matches the whole command line, so a
+    pattern naming the thing you are looking for also matches the shell that is
+    looking -- which is how an earlier version of this tooling killed itself
+    mid-run. Reading /proc and skipping our own pid and process group cannot do
+    that.
+    """
+    me, mygrp = os.getpid(), os.getpgrp()
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == me:
+            continue
+        try:
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
+            argv = [a.decode("utf-8", "replace") for a in argv if a]
+            if not argv:
+                continue
+            if os.getpgid(pid) == mygrp:
+                continue                      # our own shell and children
+        except (OSError, ProcessLookupError):
+            continue
+        if match(argv):
+            found.append((pid, " ".join(argv)[:120]))
+    return found
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def read_pid(path: Path) -> int | None:
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def policy() -> dict:
+    try:
+        return json.loads(POLICY.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def radios(pol: dict) -> list[dict]:
+    raw = pol.get("radios") or ([{"interface": pol["ap_interface"],
+                                  "channel": pol.get("channel", 36)}]
+                                if pol.get("ap_interface") else [])
+    return [r for r in raw if r.get("interface")]
+
+
+def wireless_ifaces() -> list[str]:
+    net = Path("/sys/class/net")
+    if not net.is_dir():
+        return []
+    return sorted(d.name for d in net.iterdir() if (d / "phy80211").exists())
+
+
+def port_busy(port: int, host="127.0.0.1") -> bool:
+    with socket.socket() as s:
+        s.settimeout(0.3)
+        return s.connect_ex((host, port)) == 0
+
+
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Finding:
+    ok: bool
+    detail: str
+    fixed: bool = False
+
+
+@dataclass
+class Check:
+    name: str
+    probe: Callable[[dict], Finding]
+    repair: Callable[[dict], str] | None = None
+    blocking: bool = True
+    # Some repairs only make sense once an earlier one has happened -- there is
+    # no point asking whether a channel may legally be used before the
+    # regulatory domain has been set.
+    order: int = 50
+    notes: list[str] = field(default_factory=list)
+
+
+# --- the checks ------------------------------------------------------------ #
+
+def _c_root(_pol) -> Finding:
+    if os.geteuid() == 0:
+        return Finding(True, "running as root")
+    return Finding(False, "not root -- the radio, the firewall and port 80 all need it")
+
+
+def _c_tools(_pol) -> Finding:
+    need = ["hostapd", "hostapd_cli", "dnsmasq", "nft", "iw", "ip"]
+    missing = [t for t in need if not shutil.which(t)]
+    if missing:
+        return Finding(False, f"missing: {', '.join(missing)}")
+    return Finding(True, "hostapd, dnsmasq, nftables, iw all present")
+
+
+def _r_tools(_pol) -> str:
+    rc, txt = run(["apt-get", "install", "-y", "hostapd", "dnsmasq", "nftables",
+                   "iw", "rfkill"], timeout=300)
+    return "installed the missing packages" if rc == 0 else f"apt-get failed: {txt[-200:]}"
+
+
+def _c_radios(pol) -> Finding:
+    rs = radios(pol)
+    if not rs:
+        return Finding(False, "no radios configured in policy.json")
+    missing = [r["interface"] for r in rs
+               if not Path(f"/sys/class/net/{r['interface']}").exists()]
+    if missing:
+        have = wireless_ifaces()
+        return Finding(False, f"configured radio(s) absent: {', '.join(missing)}"
+                              f"  (this host has: {', '.join(have) or 'none'})")
+    bands = {("2.4" if int(r.get("channel", 36)) <= 14 else "5") for r in rs}
+    return Finding(True, f"{len(rs)} radio(s): {', '.join(r['interface'] for r in rs)}"
+                         f"  ({', '.join(sorted(bands))} GHz)")
+
+
+def _r_radios(_pol) -> str:
+    """Let themis-ap decide the assignment; it knows which channels each phy may
+    legally beacon on, which this must not duplicate and get subtly different."""
+    rc, txt = run([sys.executable, str(THEMIS_AP), "autoconfigure",
+                   "--keep-passphrase"], timeout=180)
+    if rc != 0:
+        return f"autoconfigure failed: {txt.strip()[-240:]}"
+    pol = policy()
+    rs = radios(pol)
+    return ("assigned " + ", ".join(
+        f"{r['interface']}:ch{r['channel']}" for r in rs)) if rs else "no usable adapter found"
+
+
+def _c_rfkill(_pol) -> Finding:
+    if not shutil.which("rfkill"):
+        return Finding(True, "rfkill not installed, so nothing can be soft-blocked by it")
+    txt = out(["rfkill", "list"])
+    if re.search(r"Soft blocked:\s*yes", txt):
+        return Finding(False, "a radio is soft-blocked")
+    if re.search(r"Hard blocked:\s*yes", txt):
+        return Finding(False, "a radio is HARD-blocked -- that is a physical switch "
+                              "on the adapter, and no software can clear it")
+    return Finding(True, "no radio is rfkill-blocked")
+
+
+def _r_rfkill(_pol) -> str:
+    run(["rfkill", "unblock", "all"])
+    return "unblocked all radios"
+
+
+def _c_bt(_pol) -> Finding:
+    try:
+        loaded = {l.split()[0] for l in Path("/proc/modules").read_text().splitlines() if l.split()}
+    except OSError:
+        loaded = set()
+    bad = sorted(loaded & {"btusb", "btmtk"})
+    blacklisted = False
+    d = Path("/etc/modprobe.d")
+    if d.is_dir():
+        for f in d.glob("*.conf"):
+            try:
+                for line in f.read_text(errors="replace").splitlines():
+                    parts = line.split("#", 1)[0].split()
+                    if len(parts) >= 2 and parts[0] == "blacklist" and parts[1] == "btusb":
+                        blacklisted = True
+            except OSError:
+                continue
+    if bad:
+        return Finding(False, f"Bluetooth module(s) loaded: {', '.join(bad)}. On kernel "
+                              f"6.6+ this causes sporadic mt7921u Wi-Fi crashes, which "
+                              f"mid-exam is the worst failure this project has.")
+    if not blacklisted:
+        return Finding(False, "btusb is not loaded, but it is not blacklisted either -- "
+                              "attaching an adapter that carries Bluetooth on the same "
+                              "chip will autoload it")
+    return Finding(True, "btusb is blacklisted and not loaded (the mt7921u crash trap is closed)")
+
+
+def _r_bt(_pol) -> str:
+    did = []
+    src = TEMPLATES / "blacklist-themis-bt.conf"
+    dest = Path("/etc/modprobe.d") / src.name
+    if src.exists() and not dest.exists():
+        try:
+            dest.write_text(src.read_text())
+            did.append(f"wrote {dest}")
+        except OSError as e:
+            did.append(f"could not write {dest}: {e}")
+    run(["systemctl", "disable", "--now", "bluetooth"])
+    run(["modprobe", "-r", "btusb", "btmtk"])
+    did.append("disabled bluetooth and unloaded btusb/btmtk")
+    return "; ".join(did)
+
+
+def _c_regdom(pol) -> Finding:
+    m = re.search(r"country ([A-Z0-9]{2}):", out(["iw", "reg", "get"]))
+    cur = m.group(1) if m else None
+    want = str(pol.get("country_code", "US")).upper()
+    if cur == "00":
+        return Finding(False, "the regulatory domain is '00' (world): EVERY 5 GHz channel "
+                              "is passive-scan only, so hostapd cannot legally beacon on "
+                              "any of them, and TX power is capped near 3 dBm")
+    if cur and want and cur != want:
+        return Finding(False, f"the kernel is enforcing {cur!r} but the policy asks for "
+                              f"{want!r}; the kernel wins")
+    if not cur:
+        return Finding(False, "could not read the regulatory domain")
+    persisted = REGDOM_CONF.exists()
+    return Finding(True, f"regulatory domain {cur!r}" +
+                   ("" if persisted else "  (not persisted: it will revert on reboot)"))
+
+
+def _r_regdom(pol) -> str:
+    want = str(pol.get("country_code", "US")).upper()
+    run(["iw", "reg", "set", want])
+    time.sleep(1.2)
+    did = [f"set the regulatory domain to {want}"]
+    # Persisting matters as much as setting it. A reboot silently puts this back
+    # to '00', and the next exam then fails at `up` for a reason that looks
+    # nothing like its cause.
+    try:
+        REGDOM_CONF.write_text(
+            "# Themis: a world regulatory domain forbids every 5 GHz AP channel,\n"
+            "# and '00' is what a fresh boot uses unless something says otherwise.\n"
+            f"options cfg80211 ieee80211_regdom={want}\n")
+        did.append(f"and persisted it in {REGDOM_CONF}")
+    except OSError as e:
+        did.append(f"(could not persist it: {e})")
+    return " ".join(did)
+
+
+def _c_nm(pol) -> Finding:
+    if not shutil.which("nmcli"):
+        return Finding(True, "NetworkManager is not installed")
+    managed = []
+    lines = out(["nmcli", "-t", "-f", "DEVICE,STATE", "device"]).splitlines()
+    want = {r["interface"] for r in radios(pol)}
+    for line in lines:
+        parts = line.split(":")
+        if len(parts) >= 2 and parts[0] in want and parts[1] not in ("unmanaged", "unavailable"):
+            managed.append(parts[0])
+    if managed:
+        return Finding(False, f"NetworkManager is managing {', '.join(managed)} and will "
+                              f"tear the AP down underneath hostapd")
+    return Finding(True, "NetworkManager is not managing the exam radios")
+
+
+def _r_nm(pol) -> str:
+    done = []
+    for r in radios(pol):
+        rc, _ = run(["nmcli", "device", "set", r["interface"], "managed", "no"])
+        if rc == 0:
+            done.append(r["interface"])
+    return f"took {', '.join(done)} away from NetworkManager" if done else "nothing to do"
+
+
+def _c_supplicant(pol) -> Finding:
+    want = {r["interface"] for r in radios(pol)}
+    holding = []
+    for pid, cmd in processes(lambda a: Path(a[0]).name.startswith("wpa_supplicant")):
+        if any(f" {i}" in f" {cmd} " or f"-i{i}" in cmd for i in want):
+            holding.append((pid, cmd))
+    if holding:
+        return Finding(False, "wpa_supplicant is bound to an exam radio: " +
+                              "; ".join(f"pid {p}" for p, _ in holding))
+    return Finding(True, "no wpa_supplicant is bound to an exam radio")
+
+
+def _r_supplicant(pol) -> str:
+    """Only the instances holding OUR radios.
+
+    Stopping the service outright would take the host's own Wi-Fi down with it,
+    which on a laptop being used to run the exam is a surprising amount of
+    collateral damage for a fix.
+    """
+    want = {r["interface"] for r in radios(pol)}
+    killed = []
+    for pid, cmd in processes(lambda a: Path(a[0]).name.startswith("wpa_supplicant")):
+        if any(f" {i}" in f" {cmd} " or f"-i{i}" in cmd for i in want):
+            try:
+                os.kill(pid, 15)
+                killed.append(pid)
+            except OSError:
+                pass
+    return (f"stopped wpa_supplicant pid(s) {', '.join(map(str, killed))} that held the "
+            f"exam radios") if killed else "nothing to do"
+
+
+def _c_stale(_pol) -> Finding:
+    """Artifacts of a previous run that make the health checks lie.
+
+    A pid file outlives its process, and a hostapd log already containing
+    AP-ENABLED makes the next run's wait loop succeed instantly on the previous
+    run's success -- so `up` reports a working exam network while the new
+    hostapd is already dead.
+    """
+    if not RUN_DIR.is_dir():
+        return Finding(True, "no leftovers from a previous run")
+    stale_pids, live = [], []
+    for pf in sorted(RUN_DIR.glob("*.pid")):
+        pid = read_pid(pf)
+        if pid is None or not pid_alive(pid):
+            stale_pids.append(pf.name)
+        else:
+            live.append(f"{pf.stem} (pid {pid})")
+    state = (RUN_DIR / "state.json").exists()
+    if live:
+        return Finding(False, "an exam is already running: " + ", ".join(live))
+    if stale_pids or state:
+        bits = []
+        if stale_pids:
+            bits.append(f"stale pid file(s): {', '.join(stale_pids)}")
+        if state:
+            bits.append("a leftover state.json")
+        return Finding(False, "; ".join(bits) + " -- these make the next start's health "
+                                                "checks pass on a previous run")
+    return Finding(True, "no leftovers from a previous run")
+
+
+def _r_stale(pol) -> str:
+    did = []
+    live = []
+    for pf in sorted(RUN_DIR.glob("*.pid")) if RUN_DIR.is_dir() else []:
+        pid = read_pid(pf)
+        if pid is not None and pid_alive(pid):
+            live.append(pid)
+    if live:
+        # Something really is running. Use the project's own teardown rather than
+        # killing pids directly, so the firewall and the radios are handed back.
+        run([sys.executable, str(THEMIS_AP), "down"], timeout=120)
+        _stop_portal()
+        did.append("stopped the exam that was already running")
+    if RUN_DIR.is_dir():
+        for pat in ("*.pid", "state.json"):
+            for f in RUN_DIR.glob(pat):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+        # Rotate the logs rather than deleting them: they are the forensic record
+        # of whatever went wrong last time, and that is usually why you are here.
+        for name in ("hostapd.log", "proxy.log", "portal.log"):
+            f = RUN_DIR / name
+            if f.exists() and f.stat().st_size:
+                try:
+                    f.replace(f.with_suffix(f.suffix + ".prev"))
+                except OSError:
+                    pass
+        for f in RUN_DIR.glob("hostapd-*.log"):
+            try:
+                f.replace(f.with_suffix(f.suffix + ".prev"))
+            except OSError:
+                pass
+        did.append("cleared stale pid files and state, keeping the previous logs as .prev")
+    return "; ".join(did) or "nothing to do"
+
+
+def _c_bridge(pol) -> Finding:
+    name = pol.get("bridge", "br-themis") if len(radios(pol)) > 1 else None
+    if not name:
+        return Finding(True, "single radio, so no bridge is involved")
+    if Path(f"/sys/class/net/{name}").exists():
+        return Finding(False, f"a leftover bridge {name} still exists; the next start "
+                              f"cannot assign its address because it is already taken")
+    return Finding(True, f"no leftover {name}")
+
+
+def _r_bridge(pol) -> str:
+    name = pol.get("bridge", "br-themis")
+    run(["ip", "link", "set", name, "down"])
+    run(["ip", "link", "del", name])
+    return f"removed the leftover bridge {name}"
+
+
+def _c_addr(pol) -> Finding:
+    srv = pol.get("server_ip", "10.83.0.1")
+    dirty = []
+    for r in radios(pol):
+        txt = out(["ip", "-4", "addr", "show", "dev", r["interface"]])
+        if srv in txt:
+            dirty.append(r["interface"])
+    if dirty:
+        return Finding(False, f"{srv} is still on {', '.join(dirty)} from a previous run")
+    return Finding(True, "no exam address left on a radio")
+
+
+def _r_addr(pol) -> str:
+    for r in radios(pol):
+        run(["ip", "addr", "flush", "dev", r["interface"]])
+    return "flushed leftover addresses from the exam radios"
+
+
+def _c_ports(_pol) -> Finding:
+    busy = []
+    for port in (80, 443):
+        if port_busy(port, "0.0.0.0") or port_busy(port):
+            busy.append(port)
+    if not busy:
+        return Finding(True, "ports 80 and 443 are free")
+    return Finding(False, f"port(s) {', '.join(map(str, busy))} already in use; the portal "
+                          f"and the proxy cannot bind")
+
+
+def _r_ports(_pol) -> str:
+    """Only ever stop OUR OWN leftovers.
+
+    Something else on port 80 is the operator's web server, not ours to kill.
+    Saying so and stopping is better than silently taking down a service this
+    program does not understand.
+    """
+    killed = []
+    for pid, cmd in processes(lambda a: any("themis.server" in x or "themis.proxy" in x
+                                            for x in a)):
+        try:
+            os.kill(pid, 15)
+            killed.append(pid)
+        except OSError:
+            pass
+    if killed:
+        time.sleep(1.5)
+        return f"stopped leftover Themis listener(s): {', '.join(map(str, killed))}"
+    return ("the port is held by something that is not Themis; stop it yourself "
+            "(`sudo ss -lntp | grep -E ':80 |:443 '`) -- this will not kill a "
+            "service it does not recognise")
+
+
+def _c_forward(pol) -> Finding:
+    try:
+        v4 = Path("/proc/sys/net/ipv4/ip_forward").read_text().strip()
+    except OSError:
+        v4 = "?"
+    prof = pol.get("profile", "airgap")
+    if prof in ("airgap", "proxy") and v4 == "1":
+        return Finding(False, f"ip_forward=1 but the profile is {prof!r}: students could be "
+                              f"routed off this host, and a self-hosted VPN would work")
+    if prof == "allowlist" and v4 != "1":
+        return Finding(False, "profile 'allowlist' needs ip_forward=1")
+    return Finding(True, f"ip forwarding is {'off' if v4 == '0' else 'on'}, which is right "
+                         f"for profile {prof!r}")
+
+
+def _r_forward(pol) -> str:
+    want = "1" if pol.get("profile") == "allowlist" else "0"
+    run(["sysctl", "-w", f"net.ipv4.ip_forward={want}"])
+    if want == "0":
+        run(["sysctl", "-w", "net.ipv6.conf.all.forwarding=0"])
+    return f"set ip_forward={want}"
+
+
+def _c_passphrase(pol) -> Finding:
+    if (pol.get("enterprise") or {}).get("enabled"):
+        return Finding(True, "WPA2-Enterprise: no shared passphrase to set")
+    if pol.get("passphrase") in (None, "", "CHANGE-ME-EVERY-EXAM"):
+        return Finding(False, "the passphrase is still the placeholder")
+    return Finding(True, "a passphrase is set")
+
+
+def _r_passphrase(_pol) -> str:
+    import secrets
+    pol = policy()
+    pol["passphrase"] = secrets.token_urlsafe(12)
+    POLICY.write_text(json.dumps(pol, indent=2) + "\n")
+    return f"minted a fresh passphrase: {pol['passphrase']}"
+
+
+def _c_preflight(_pol) -> Finding:
+    """Finally, ask themis-ap itself.
+
+    Everything above repairs the host. This asks the program that will actually
+    bring the network up whether it is now satisfied -- including the checks only
+    it can make, like whether the chosen channel may legally be beaconed on.
+    """
+    rc, txt = run([sys.executable, str(THEMIS_AP), "preflight", "--json"], timeout=90)
+    try:
+        data = json.loads(txt[txt.index("{"):txt.rindex("}") + 1])
+    except (ValueError, json.JSONDecodeError):
+        return Finding(False, f"could not run preflight (exit {rc}): {txt.strip()[:200]}")
+    fails = [f["message"].splitlines()[0] for f in data.get("fail", [])]
+    if fails:
+        return Finding(False, "themis-ap preflight still refuses: " + "; ".join(fails))
+    warns = len(data.get("warn", []))
+    return Finding(True, f"themis-ap preflight is satisfied"
+                         f"{f' ({warns} warning(s))' if warns else ''}")
+
+
+CHECKS: list[Check] = [
+    Check("root", _c_root, None, True, 0),
+    Check("tools", _c_tools, _r_tools, True, 5),
+    Check("radios", _c_radios, _r_radios, True, 10),
+    Check("rfkill", _c_rfkill, _r_rfkill, True, 15),
+    Check("bluetooth trap", _c_bt, _r_bt, False, 20),
+    Check("regulatory domain", _c_regdom, _r_regdom, True, 25),
+    Check("NetworkManager", _c_nm, _r_nm, True, 30),
+    Check("wpa_supplicant", _c_supplicant, _r_supplicant, True, 32),
+    Check("previous run", _c_stale, _r_stale, True, 35),
+    Check("leftover bridge", _c_bridge, _r_bridge, True, 38),
+    Check("leftover address", _c_addr, _r_addr, True, 40),
+    Check("ports 80/443", _c_ports, _r_ports, True, 42),
+    Check("ip forwarding", _c_forward, _r_forward, True, 45),
+    Check("passphrase", _c_passphrase, _r_passphrase, True, 48),
+    Check("themis-ap preflight", _c_preflight, None, True, 90),
+]
+
+
+# --------------------------------------------------------------------------- #
+
+def doctor(*, apply: bool) -> tuple[int, int]:
+    """Run every check, repairing what can be repaired. Returns (blockers, fixed)."""
+    pol = policy()
+    blockers = fixed = 0
+    print(f"{C_B}themis doctor{C_0}" + ("" if apply else f" {C_DIM}(dry run: nothing will be changed){C_0}"))
+    print()
+    for chk in sorted(CHECKS, key=lambda c: c.order):
+        pol = policy()                      # a repair may have rewritten it
+        f = chk.probe(pol)
+        if f.ok:
+            print(f"  {C_OK}ok{C_0}    {chk.name}: {f.detail}")
+            continue
+        if chk.repair is None:
+            mark = f"{C_BAD}FAIL{C_0}" if chk.blocking else f"{C_WARN}warn{C_0}"
+            print(f"  {mark}  {chk.name}: {f.detail}")
+            blockers += 1 if chk.blocking else 0
+            continue
+        if not apply:
+            print(f"  {C_WARN}would fix{C_0}  {chk.name}: {f.detail}")
+            blockers += 1 if chk.blocking else 0
+            continue
+        print(f"  {C_WARN}fixing{C_0}  {chk.name}: {f.detail}")
+        detail = chk.repair(pol)
+        again = chk.probe(policy())
+        if again.ok:
+            print(f"        {C_OK}fixed{C_0} -- {detail}")
+            fixed += 1
+        else:
+            mark = f"{C_BAD}STILL FAILING{C_0}" if chk.blocking else f"{C_WARN}still warning{C_0}"
+            print(f"        {mark} -- {detail}")
+            print(f"        {again.detail}")
+            blockers += 1 if chk.blocking else 0
+    print()
+    return blockers, fixed
+
+
+def _stop_portal() -> None:
+    pid = read_pid(PORTAL_PID)
+    if pid and pid_alive(pid):
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
+    PORTAL_PID.unlink(missing_ok=True)
+    for pid, _cmd in processes(lambda a: any("themis.server" in x for x in a)):
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
+
+
+def _start_portal() -> tuple[bool, str]:
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    log = (RUN_DIR / "portal.log").open("a")
+    env = dict(os.environ, PYTHONUNBUFFERED="1")
+    # start_new_session detaches it from this terminal, so closing the window or
+    # pressing Ctrl-C here cannot take the exam portal down with it. That is not
+    # hypothetical: the portal died exactly that way during a live session.
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "themis.server", "--policy", str(POLICY),
+         "--console-port", str(CONSOLE_PORT)],
+        cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL, start_new_session=True, env=env)
+    PORTAL_PID.write_text(str(proc.pid))
+    for _ in range(40):
+        if proc.poll() is not None:
+            tail = (RUN_DIR / "portal.log").read_text(errors="replace")[-600:]
+            return False, f"the portal exited immediately:\n{tail}"
+        if port_busy(80, "0.0.0.0") or port_busy(80):
+            return True, f"portal on :80, console on 127.0.0.1:{CONSOLE_PORT}"
+        time.sleep(0.25)
+    tail = (RUN_DIR / "portal.log").read_text(errors="replace")[-600:]
+    return False, f"the portal never bound port 80:\n{tail}"
+
+
+def cmd_start(args) -> int:
+    blockers, fixed = doctor(apply=not args.dry_run)
+    if args.dry_run:
+        print(f"  {C_DIM}dry run -- nothing was changed and nothing was started{C_0}\n")
+        return 1 if blockers else 0
+    if blockers:
+        print(f"  {C_BAD}{blockers} problem(s) this cannot fix on its own.{C_0}")
+        print(f"  Nothing was started. Read the lines above: each names its own fix.\n")
+        return 1
+    if fixed:
+        print(f"  {C_OK}repaired {fixed} thing(s).{C_0} Starting the exam.\n")
+
+    print(f"{C_B}bringing up the exam network{C_0}")
+    rc, txt = run([sys.executable, str(THEMIS_AP), "up"], timeout=240)
+    for line in txt.splitlines():
+        if line.strip():
+            print(f"  {line}")
+    if rc != 0:
+        print(f"\n  {C_BAD}the network did not come up, so nothing else was started.{C_0}\n")
+        return 1
+
+    print(f"\n{C_B}starting the portal and the proctor console{C_0}")
+    ok, detail = _start_portal()
+    print(f"  {detail}" if ok else f"  {C_BAD}{detail}{C_0}")
+    if not ok:
+        print(f"  The network is up, but students would get no sign-in page.\n")
+        return 1
+    print()
+    return cmd_status(args)
+
+
+def cmd_stop(_args) -> int:
+    if os.geteuid() != 0:
+        print("themis: stop must run as root", file=sys.stderr)
+        return 1
+    print(f"{C_B}stopping the exam{C_0}")
+    _stop_portal()
+    print("  stopped the portal and console")
+    rc, txt = run([sys.executable, str(THEMIS_AP), "down"], timeout=180)
+    for line in txt.splitlines():
+        if line.strip():
+            print(f"  {line}")
+    journal = DATA_DIR / "exam.jsonl"
+    print()
+    if journal.exists():
+        n = sum(1 for _ in journal.open(errors="replace"))
+        print(f"  the exam record is untouched: {journal} ({n} events)")
+    else:
+        print(f"  the exam record is untouched: {journal} (none yet)")
+    print()
+    return 0 if rc == 0 else 1
+
+
+def cmd_status(_args) -> int:
+    pol = policy()
+    rs = radios(pol)
+    multi = len(rs) > 1
+    print(f"{C_B}status{C_0}")
+    any_up = False
+    for r in rs:
+        iface = r["interface"]
+        pf = RUN_DIR / (f"hostapd-{iface}.pid" if multi else "hostapd.pid")
+        pid = read_pid(pf)
+        up = pid is not None and pid_alive(pid)
+        any_up = any_up or up
+        band = "2.4" if int(r.get("channel", 36)) <= 14 else "5"
+        state = f"{C_OK}beaconing{C_0}" if up else f"{C_DIM}not running{C_0}"
+        print(f"  radio    {iface:<8} {band} GHz  ch {r.get('channel'):<4} {state}")
+    dn = read_pid(RUN_DIR / "dnsmasq.pid")
+    px = read_pid(RUN_DIR / "proxy.pid")
+    po = read_pid(PORTAL_PID)
+    for label, pid in (("dnsmasq", dn), ("proxy", px), ("portal", po)):
+        alive = pid is not None and pid_alive(pid)
+        print(f"  {label:<8} {'running' if alive else C_DIM + 'not running' + C_0}")
+    mode = ("blocklist" if pol.get("proxy_mode") == "block"
+            else "allowlist" if pol.get("profile") == "proxy" else pol.get("profile", "?"))
+    print(f"  mode     {mode}")
+    print(f"  ssid     {pol.get('ssid')}")
+    if any_up:
+        print(f"  password {pol.get('passphrase')}")
+    key = "block_dns_names" if mode == "blocklist" else "allow_dns_names"
+    names = [n for n in (pol.get(key) or []) if not str(n).startswith("_")]
+    print(f"  {'blocked' if mode == 'blocklist' else 'reachable':<8} "
+          f"{', '.join(names) if names else '(nothing)'}")
+    print()
+    if any_up:
+        print(f"  students   http://{pol.get('server_ip', '10.83.0.1')}/")
+        print(f"  console    http://127.0.0.1:{CONSOLE_PORT}/   (loopback only)")
+        print(f"  record     {DATA_DIR / 'exam.jsonl'}")
+        print(f"  refusals   {RUN_DIR / 'proxy-decisions.log'}")
+        print()
+        print(f"  Verify it refuses what you think it does:")
+        print(f"      sudo bash tools/verify_blocking.sh")
+    print()
+    return 0
+
+
+def cmd_panel(_args) -> int:
+    if os.geteuid() != 0:
+        print("themis: the panel must run as root", file=sys.stderr)
+        return 1
+    blockers, _ = doctor(apply=True)
+    if blockers:
+        print(f"  {C_WARN}{blockers} unresolved problem(s) -- the panel will show them too.{C_0}\n")
+    os.execv(sys.executable, [sys.executable, "-m", "themis.operator"])
+
+
+def cmd_doctor(args) -> int:
+    blockers, fixed = doctor(apply=not args.dry_run)
+    if args.dry_run:
+        print(f"  {C_DIM}dry run: nothing was changed.{C_0}\n")
+        return 1 if blockers else 0
+    if blockers:
+        print(f"  {C_BAD}{blockers} problem(s) this cannot fix on its own.{C_0}\n")
+        return 1
+    print(f"  {C_OK}this host is fit to run an exam.{C_0}"
+          + (f" Repaired {fixed}." if fixed else "") + "\n")
+    return 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="exam", description=__doc__.splitlines()[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="With no command, `start` is assumed.")
+    sub = ap.add_subparsers(dest="cmd")
+    for name, fn, helptext in (
+        ("start", cmd_start, "repair whatever is in the way, then run the exam"),
+        ("doctor", cmd_doctor, "find and fix the problems; start nothing"),
+        ("stop", cmd_stop, "stop the exam and hand the host back"),
+        ("status", cmd_status, "what is running"),
+        ("panel", cmd_panel, "repair, then open the operator panel"),
+    ):
+        p = sub.add_parser(name, help=helptext)
+        p.add_argument("--dry-run", action="store_true",
+                       help="say what would change, change nothing")
+        p.set_defaults(func=fn)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    # `./exam` on its own means `./exam start`, but only when the first word is
+    # not already a command -- otherwise `./exam --dry-run` would be swallowed.
+    known = {"start", "doctor", "stop", "status", "panel", "-h", "--help"}
+    if not raw or raw[0] not in known:
+        raw = ["start"] + raw
+    args = ap.parse_args(raw)
+
+    if sys.platform != "linux":
+        print(f"themis runs on the Linux exam host; this is {sys.platform}.", file=sys.stderr)
+        return 1
+    if os.geteuid() != 0 and args.func is not cmd_status:
+        print(f"{C_BAD}themis must run as root{C_0} -- it repairs the radio, the firewall\n"
+              f"and port 80, none of which are writable otherwise:\n\n"
+              f"    sudo ./exam {args.cmd or 'start'}\n", file=sys.stderr)
+        return 1
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        print("\ninterrupted; nothing further was started.", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
