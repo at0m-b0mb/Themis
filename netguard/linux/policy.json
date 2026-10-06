@@ -42,7 +42,9 @@
     "sso.canvaslms.com",
     "du11hjcvx0uqb.cloudfront.net",
     "instructure-uploads.s3.amazonaws.com",
-    "inst-fs-iad-prod.inscloudgate.net"
+    "inst-fs-iad-prod.inscloudgate.net",
+    "challenges.cloudflare.com",
+    "prod.ally.ac"
   ],
   "allow_egress": [],
   "enterprise": {
